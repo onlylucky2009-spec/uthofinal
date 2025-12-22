@@ -5,10 +5,10 @@ import threading
 import json
 from datetime import datetime, timedelta
 import pytz
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 # Core FastAPI & Server
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -16,40 +16,39 @@ import uvicorn
 # Kite Connect SDK
 from kiteconnect import KiteConnect, KiteTicker
 
-# --- THE CRITICAL FIX: TWISTED SIGNAL BYPASS ---
-# This block MUST run before any KiteTicker connection is established.
-# It patches the Twisted reactor to prevent it from trying to catch
-# OS signals (SIGTERM/SIGINT) which can only be done in the main thread.
+# --- CRITICAL FIX 1: TWISTED SIGNAL BYPASS (FOR HEROKU) ---
+# This must run before any KiteTicker instance is created.
 from twisted.internet import reactor
 _original_run = reactor.run
 def _patched_reactor_run(*args, **kwargs):
+    # This disables Twisted from trying to install signal handlers in a background thread
     kwargs['installSignalHandlers'] = False
     return _original_run(*args, **kwargs)
 reactor.run = _patched_reactor_run
-# ----------------------------------------------
+# ---------------------------------------------------------
 
-# Optimized Event Loop (C-based) for High-Frequency I/O
+# High-Performance Event Loop
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 except ImportError:
     pass
 
-# Custom Async Logic & Data Managers
+# Custom Engine Modules & Managers
 from breakout_engine import BreakoutEngine
 from momentum_engine import MomentumEngine
 from redis_manager import TradeControl
 
-# --- DETAILED LOGGING SETUP ---
+# --- LOGGING SETUP ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-    datefmt='%H:%M:%S'
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger("Nexus_Async_Core")
 IST = pytz.timezone("Asia/Kolkata")
 
-# --- FASTAPI APP CONFIG ---
+# --- FASTAPI APP ---
 app = FastAPI(strict_slashes=False)
 app.add_middleware(
     CORSMiddleware, 
@@ -59,14 +58,16 @@ app.add_middleware(
 )
 
 # --- STOCK UNIVERSE ---
-# [USER: PASTE YOUR 500+ STOCK_INDEX_MAPPING DICTIONARY HERE]
+# [USER: Please paste your dictionary of 500+ stocks here]
 STOCK_INDEX_MAPPING = {
-'MINDTECK': 'NIFTY 500',
-'NITIRAJ': 'NIFTY 500',
+    "RELIANCE": "NIFTY 50",
+    "TCS": "NIFTY 50",
+    "INFY": "NIFTY 50"
 } 
 
-# --- CONSOLIDATED ASYNC RAM STATE ---
+# --- CONSOLIDATED RAM STATE ---
 RAM_STATE = {
+    "main_loop": None, # CRITICAL: Stores the reference to the FastAPI uvloop
     "kite": None,
     "kws": None,
     "api_key": "",
@@ -89,27 +90,38 @@ RAM_STATE = {
     "manual_exits": set()
 }
 
-# --- ASYNC BRIDGE: TICKER TO FASTAPI EVENT LOOP ---
+# --- CRITICAL FIX 2: ASYNC BRIDGE (THREAD TO UVLOOP) ---
 def on_ticks(ws, ticks):
     """
-    Bridge that receives ticks from the Twisted thread and injects 
-    them into the FastAPI Async Event Loop for superfast processing.
+    Receives ticks from Kite's background thread and safely schedules 
+    them into the FastAPI main event loop.
     """
-    loop = asyncio.get_event_loop()
+    if not RAM_STATE["main_loop"]:
+        return
+
     for tick in ticks:
         token = tick['instrument_token']
         if token in RAM_STATE["stocks"]:
             ltp = tick['last_price']
             vol = tick.get('volume_traded', 0)
             
-            # Non-blocking RAM update for fast reading by the UI
+            # 1. Update LTP in RAM immediately (Thread-safe reading)
             RAM_STATE["stocks"][token]['ltp'] = ltp
             
-            # Schedule the heavy processing logic in the main async loop
-            asyncio.run_coroutine_threadsafe(
-                BreakoutEngine.run(token, ltp, vol, RAM_STATE),
-                loop
-            )
+            # 2. Forward to Engines inside the main Async Loop
+            try:
+                # This function is the ONLY way to call async code from a thread
+                asyncio.run_coroutine_threadsafe(
+                    BreakoutEngine.run(token, ltp, vol, RAM_STATE),
+                    RAM_STATE["main_loop"]
+                )
+                asyncio.run_coroutine_threadsafe(
+                    MomentumEngine.run(token, ltp, vol, RAM_STATE),
+                    RAM_STATE["main_loop"]
+                )
+            except Exception as e:
+                # Silently catch bridge errors to maintain ticker stability
+                pass
 
 def on_connect(ws, response):
     logger.info("✅ TICKER: Handshake successful. Subscribing to tokens...")
@@ -117,7 +129,7 @@ def on_connect(ws, response):
     if tokens:
         ws.subscribe(tokens)
         ws.set_mode(ws.MODE_FULL, tokens)
-        logger.info(f"✅ TICKER: Subscribed to {len(tokens)} tokens in FULL mode.")
+        logger.info(f"✅ TICKER: Subscribed to {len(tokens)} stocks in FULL mode.")
     RAM_STATE["data_connected"]["breakout"] = True
     RAM_STATE["data_connected"]["momentum"] = True
 
@@ -129,11 +141,14 @@ def on_close(ws, code, reason):
     RAM_STATE["data_connected"]["breakout"] = False
     RAM_STATE["data_connected"]["momentum"] = False
 
-# --- LIFECYCLE: ASYNC SYSTEM STARTUP ---
+# --- SYSTEM LIFECYCLE: STARTUP ---
 
 @app.on_event("startup")
 async def startup_event():
     logger.info("--- 🚀 NEXUS ASYNC ENGINE BOOTING ---")
+    
+    # CAPTURE THE RUNNING LOOP (The Fix for RuntimeError)
+    RAM_STATE["main_loop"] = asyncio.get_running_loop()
     
     # 1. Restore API Credentials from Redis
     key, secret = await TradeControl.get_config()
@@ -170,22 +185,21 @@ async def startup_event():
                     if t_id in RAM_STATE["stocks"]:
                         RAM_STATE["stocks"][t_id].update(data)
             
-            # 4. Start Ticker with Patched Reactor
-            # We use threaded=True to ensure it doesn't block the main thread
+            # 4. Start Ticker (Threaded=True uses our patched reactor internally)
             RAM_STATE["kws"] = KiteTicker(key, token)
             RAM_STATE["kws"].on_ticks = on_ticks
             RAM_STATE["kws"].on_connect = on_connect
             RAM_STATE["kws"].on_error = on_error
             RAM_STATE["kws"].on_close = on_close
             
-            # Start Ticker. This will now bypass signal installation.
+            # This runs Twisted in a background thread. Fix 1 prevents Signal errors.
             RAM_STATE["kws"].connect(threaded=True)
             logger.info("🛰️ SYSTEM: Ticker initialized in background thread (Signal-Safe).")
 
         except Exception as e:
             logger.error(f"❌ STARTUP CRASH: {e}")
 
-# --- DASHBOARD & API ENDPOINTS ---
+# --- WEB & API ENDPOINTS ---
 
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard():
@@ -193,6 +207,7 @@ async def get_dashboard():
 
 @app.get("/api/stats")
 async def get_stats():
+    """Provides real-time stats for the Dashboard UI."""
     total_pnl = 0.0
     engine_stats = {}
     for side in ["bull", "bear", "mom_bull", "mom_bear"]:
@@ -208,10 +223,13 @@ async def get_stats():
     }
 
 @app.get("/api/orders")
-async def get_orders(): return RAM_STATE["trades"]
+async def get_orders(): 
+    """Returns all active and closed trades for the current session."""
+    return RAM_STATE["trades"]
 
 @app.get("/api/scanner")
 async def get_scanner():
+    """Returns stocks that have generated a pre-trigger signal."""
     signals = {side: [] for side in ["bull", "bear", "mom_bull", "mom_bear"]}
     for t_id, s in RAM_STATE["stocks"].items():
         if s.get('status') in ['TRIGGER_WATCH', 'MOM_TRIGGER_WATCH']:
@@ -222,17 +240,18 @@ async def get_scanner():
 
 @app.post("/api/control")
 async def control_center(data: dict):
+    """Handles engine toggles and API credential saves."""
     action = data.get("action")
     if action == "save_api":
         key, secret = data.get("api_key"), data.get("api_secret")
         RAM_STATE["api_key"], RAM_STATE["api_secret"] = key, secret
         await TradeControl.save_config(key, secret)
-        logger.info("💾 CONTROL: API credentials persisted.")
+        logger.info("💾 CONTROL: API credentials persisted to Redis.")
     elif action == "get_saved_keys":
         return {"api_key": RAM_STATE["api_key"], "api_secret": "********" if RAM_STATE["api_secret"] else ""}
     elif action == "toggle_engine":
         RAM_STATE["engine_live"][data['side']] = data['enabled']
-        logger.info(f"⚙️ CONTROL: Engine {data['side']} toggled to {data['enabled']}")
+        logger.info(f"⚙️ CONTROL: Engine {data['side']} set to {data['enabled']}")
     elif action == "manual_exit":
         RAM_STATE["manual_exits"].add(data['symbol'])
     return {"status": "ok"}
@@ -255,6 +274,7 @@ async def kite_login_redirect():
 
 @app.get("/login")
 async def kite_callback(request_token: str = None):
+    """The URL Zerodha redirects to after user login."""
     try:
         api_key, api_secret = RAM_STATE["api_key"], RAM_STATE["api_secret"]
         kite = KiteConnect(api_key=api_key)
@@ -262,7 +282,7 @@ async def kite_callback(request_token: str = None):
         
         token = data["access_token"]
         await TradeControl.save_access_token(token)
-        logger.info("🔑 AUTH: Zerodha Login successful. Token persisted.")
+        logger.info("🔑 AUTH: Zerodha Session established. Access token saved.")
         
         return RedirectResponse(url="/")
     except Exception as e:
@@ -272,6 +292,7 @@ async def kite_callback(request_token: str = None):
 # --- SERVER ENTRY POINT ---
 
 if __name__ == "__main__":
+    # Get port from Heroku environment
     port = int(os.environ.get("PORT", 8000))
-    # Crucial: Use uvloop for the high-performance async ticker bridge
+    # CRITICAL: Use workers=1 to prevent multiple WebSocket connections
     uvicorn.run("main:app", host="0.0.0.0", port=port, loop="uvloop", workers=1)
