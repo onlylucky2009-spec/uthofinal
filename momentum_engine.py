@@ -1,132 +1,203 @@
 import logging
-from datetime import datetime, time as dt_time
+import asyncio
+from datetime import datetime
 from math import floor
 import pytz
 from redis_manager import TradeControl
 
+# --- LOGGING SETUP ---
 logger = logging.getLogger("Nexus_Momentum")
 IST = pytz.timezone("Asia/Kolkata")
 
 class MomentumEngine:
+    
     @staticmethod
-    def run(token, ltp, vol, state):
+    async def run(token: int, ltp: float, vol: int, state: dict):
+        """
+        The main asynchronous entry point for tick processing.
+        Handles Candle formation and Momentum detection.
+        """
         stock = state["stocks"].get(token)
-        if not stock or stock['symbol'] in state.get("banned", set()): 
-            return
-            
-        now_dt = datetime.now(IST)
-        now_time = now_dt.time()
-
-        # 1. Monitor Active Momentum Trades
-        if stock.get('status') == 'OPEN_MOM':
-            MomentumEngine.monitor_active_trade(stock, ltp, state)
+        if not stock:
             return
 
-        # 2. 9:15 - 9:16: Range Formation (High/Low of first minute)
-        if dt_time(9, 15) <= now_time < dt_time(9, 16):
-            stock['hi'] = max(stock['hi'], ltp) if stock['hi'] > 0 else ltp
-            stock['lo'] = min(stock['lo'], ltp) if stock['lo'] > 0 else ltp
-            
-            if not stock.get('candle_915'): 
-                stock['candle_915'] = {'volume': 0, 'close': ltp}
-            
-            stock['candle_915']['close'] = ltp
+        # 1. MONITOR ACTIVE MOMENTUM TRADES
+        if stock['status'] == 'MOM_OPEN':
+            await MomentumEngine.monitor_active_trade(stock, ltp, state)
+            return
+
+        # 2. TRIGGER WATCH (Price confirmation for momentum)
+        if stock['status'] == 'MOM_TRIGGER_WATCH':
+            # Bullish Momentum Trigger
+            if stock['side_latch'] == 'MOM_BULL' and ltp >= stock['trigger_px']:
+                await MomentumEngine.open_trade(token, stock, ltp, state, 'mom_bull')
+            # Bearish Momentum Trigger
+            elif stock['side_latch'] == 'MOM_BEAR' and ltp <= stock['trigger_px']:
+                await MomentumEngine.open_trade(token, stock, ltp, state, 'mom_bear')
+            return
+
+        # 3. ASYNC CANDLE FORMATION
+        now = datetime.now(IST)
+        bucket = now.replace(second=0, microsecond=0)
+
+        if stock['candle'] and stock['candle']['bucket'] != bucket:
+            # Candle Closed -> Analyze Momentum logic in background
+            asyncio.create_task(MomentumEngine.analyze_momentum_logic(token, stock['candle'], state))
+            stock['candle'] = {'bucket': bucket, 'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp, 'volume': 0}
+        elif not stock['candle']:
+            stock['candle'] = {'bucket': bucket, 'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp, 'volume': 0}
+        else:
+            c = stock['candle']
+            c['high'] = max(c['high'], ltp)
+            c['low'] = min(c['low'], ltp)
+            c['close'] = ltp
             if stock['last_vol'] > 0:
-                stock['candle_915']['volume'] += max(0, vol - stock['last_vol'])
-            
-            stock['last_vol'] = vol
-            return
-
-        # 3. Post 9:16: Trigger Logic
-        if stock.get('status') == 'WAITING' and now_time >= dt_time(9, 16):
-            # BULL TRIGGER
-            if state["engine_live"]["mom_bull"] and ltp > (stock['hi'] * 1.0001):
-                if MomentumEngine.is_vol_qualified(stock, 'mom_bull', state):
-                    # Atomic Limit Check using Redis LUA
-                    limit = state["config"]["mom_bull"]["total_trades"]
-                    if TradeControl.can_trade("mom_bull", limit):
-                        MomentumEngine.open_trade("mom_bull", stock, ltp, state)
-            
-            # BEAR TRIGGER
-            elif state["engine_live"]["mom_bear"] and ltp < (stock['lo'] * 0.9999):
-                if MomentumEngine.is_vol_qualified(stock, 'mom_bear', state):
-                    limit = state["config"]["mom_bear"]["total_trades"]
-                    if TradeControl.can_trade("mom_bear", limit):
-                        MomentumEngine.open_trade("mom_bear", stock, ltp, state)
+                c['volume'] += max(0, vol - stock['last_vol'])
         
         stock['last_vol'] = vol
 
     @staticmethod
-    def is_vol_qualified(stock, side, state):
-        c = stock.get('candle_915')
-        if not c: return False
-        
-        matrix = state["config"][side].get('volume_criteria', [])
-        if not matrix: return True
-        
-        c_vol = c['volume']
-        c_val_cr = (c_vol * c['close']) / 10000000.0
-        s_sma = stock.get('sma', 0)
-        
-        for level in matrix:
-            try:
-                min_sma = float(level.get('min_sma_avg', 0))
-                sma_mult = float(level.get('sma_multiplier', 1))
-                min_cr = float(level.get('min_vol_price_cr', 0))
-                
-                if s_sma >= min_sma and c_vol >= (s_sma * sma_mult) and c_val_cr >= min_cr:
-                    return True
-            except: continue
-        return False
+    async def analyze_momentum_logic(token: int, candle: dict, state: dict):
+        """
+        Checks for price velocity and volume surges.
+        """
+        stock = state["stocks"][token]
+        body_size = abs(candle['close'] - candle['open'])
+        body_pct = (body_size / candle['open']) * 100 if candle['open'] > 0 else 0
+
+        # --- BULLISH MOMENTUM ---
+        if state["engine_live"].get("mom_bull") and candle['close'] > candle['open']:
+            # Requirement: Strong green candle (e.g. > 0.3% body)
+            if body_pct > 0.25:
+                is_qualified, detail = await MomentumEngine.check_vol_matrix(stock, candle, 'mom_bull', state)
+                if is_qualified:
+                    logger.info(f"⚡ [MOM-BULL] {stock['symbol']} Surge | Body: {body_pct:.2f}% | {detail}")
+                    stock['status'] = 'MOM_TRIGGER_WATCH'
+                    stock['side_latch'] = 'MOM_BULL'
+                    stock['trigger_px'] = round(candle['high'] + (body_size * 0.1), 2)
+
+        # --- BEARISH MOMENTUM ---
+        elif state["engine_live"].get("mom_bear") and candle['close'] < candle['open']:
+            if body_pct > 0.25:
+                is_qualified, detail = await MomentumEngine.check_vol_matrix(stock, candle, 'mom_bear', state)
+                if is_qualified:
+                    logger.info(f"🔻 [MOM-BEAR] {stock['symbol']} Crash | Body: {body_pct:.2f}% | {detail}")
+                    stock['status'] = 'MOM_TRIGGER_WATCH'
+                    stock['side_latch'] = 'MOM_BEAR'
+                    stock['trigger_px'] = round(candle['low'] - (body_size * 0.1), 2)
 
     @staticmethod
-    def open_trade(side, stock, price, state):
-        cfg = state["config"][side]
-        sl_pct = float(cfg.get('stop_loss_pct', 0.5)) / 100.0
-        risk_amt = float(cfg.get('risk_per_trade', 2000))
+    async def check_vol_matrix(stock: dict, candle: dict, side: str, state: dict):
+        """Asynchronous Volume validation using SMA tiers."""
+        matrix = state["config"][side].get('volume_criteria', [])
+        c_vol = candle['volume']
+        s_sma = stock.get('sma', 0)
+        c_val_cr = (c_vol * candle['close']) / 10000000.0
+
+        if not matrix: return True, "No Vol Matrix"
+
+        qualified_tier = None
+        for i, level in enumerate(matrix):
+            min_sma = float(level.get('min_sma_avg', 0))
+            if s_sma >= min_sma: qualified_tier = (i, level)
+            else: break
+
+        if qualified_tier:
+            idx, level = qualified_tier
+            mult, min_cr = float(level.get('sma_multiplier', 1.0)), float(level.get('min_vol_price_cr', 0))
+            target_vol = s_sma * mult
+            if c_vol >= target_vol and c_val_cr >= min_cr:
+                return True, f"L{idx+1} OK: Vol {c_vol:,.0f} > {target_vol:,.0f}"
         
-        qty = max(1, int(floor(risk_amt / (price * sl_pct))))
-        rr_val = float(str(cfg.get('risk_reward', '1:2')).split(':')[1])
+        return False, "Vol matrix fail"
+
+    @staticmethod
+    async def open_trade(token: int, stock: dict, ltp: float, state: dict, side_key: str):
+        """Executes trade entry with Redis atomic limit checks."""
+        cfg = state["config"][side_key]
         
-        is_bull = "bull" in side
-        sl_price = price * (1 - sl_pct) if is_bull else price * (1 + sl_pct)
-        target_price = price * (1 + (sl_pct * rr_val)) if is_bull else price * (1 - (sl_pct * rr_val))
+        if not await TradeControl.can_trade(side_key, int(cfg.get('total_trades', 5))):
+            logger.warning(f"🚫 [LIMIT] {side_key.upper()} Limit Reached for {stock['symbol']}")
+            stock['status'] = 'WAITING'
+            return
+
+        # Risk Management
+        candle = stock['candle']
+        risk = abs(ltp - candle['low']) if 'bull' in side_key else abs(ltp - candle['high'])
+        if risk < (ltp * 0.002): risk = ltp * 0.005 # Minimum risk floor
+
+        # Position Sizing
+        total_risk = float(cfg.get('risk_trade_1', 2000))
+        qty = floor(total_risk / risk)
         
-        trade_obj = {
+        if qty <= 0:
+            stock['status'] = 'WAITING'
+            return
+
+        # Target (R:R)
+        rr_val = float(cfg.get('risk_reward', "1:2").split(':')[-1])
+        target_px = round(ltp + (risk * rr_val), 2) if 'bull' in side_key else round(ltp - (risk * rr_val), 2)
+        sl_px = round(ltp - risk, 2) if 'bull' in side_key else round(ltp + risk, 2)
+
+        trade = {
             "symbol": stock['symbol'],
-            "entry_price": price,
-            "ltp": price,
-            "sl_price": sl_price,
-            "target_price": target_price,
-            "qty": qty,
-            "side": "BUY" if is_bull else "SELL",
-            "opened_at": datetime.now(IST).strftime("%H:%M:%S")
+            "qty": qty, "entry_price": ltp, "sl_price": sl_px,
+            "target_price": target_px, "pnl": 0.0,
+            "entry_time": datetime.now(IST).strftime("%H:%M:%S")
         }
         
-        state["trades"][side].append(trade_obj)
-        stock['status'] = 'OPEN_MOM'
-        logger.info(f"MOMENTUM TRADE OPENED: {stock['symbol']} Qty: {qty}")
-
-    @staticmethod
-    def monitor_active_trade(stock, ltp, state):
-        for side in ["mom_bull", "mom_bear"]:
-            state["trades"][side] = [t for t in state["trades"][side] if t['symbol'] != stock['symbol'] or MomentumEngine.process_exit(t, ltp, stock, state, side)]
-
-    @staticmethod
-    def process_exit(trade, ltp, stock, state, side):
-        trade['ltp'] = ltp
-        is_exit = False
+        state["trades"][side_key].append(trade)
+        stock['status'] = 'MOM_OPEN'
+        stock['active_trade'] = trade
         
-        if trade['side'] == 'BUY':
-            if ltp >= trade['target_price'] or ltp <= trade['sl_price']: is_exit = True
+        logger.info(f"🔥 [MOM-ENTRY] {stock['symbol']} {side_key.upper()} @ {ltp} | Qty: {qty} | Tgt: {target_px}")
+
+    @staticmethod
+    async def monitor_active_trade(stock: dict, ltp: float, state: dict):
+        """Real-time trade management (Target, SL, TSL)."""
+        trade = stock.get('active_trade')
+        if not trade: return
+        
+        side_key = stock['side_latch'].lower()
+        cfg = state["config"][side_key]
+        is_bull = 'bull' in side_key
+
+        # Live PnL
+        trade['pnl'] = (ltp - trade['entry_price']) * trade['qty'] if is_bull else (trade['entry_price'] - ltp) * trade['qty']
+
+        # 1. CHECK TARGET
+        if (is_bull and ltp >= trade['target_price']) or (not is_bull and ltp <= trade['target_price']):
+            logger.info(f"🎯 [MOM-TARGET] {stock['symbol']} closed @ {ltp}")
+            await MomentumEngine.close_position(stock, state, "TARGET")
+
+        # 2. CHECK SL
+        elif (is_bull and ltp <= trade['sl_price']) or (not is_bull and ltp >= trade['sl_price']):
+            logger.info(f"🛑 [MOM-SL] {stock['symbol']} stopped @ {ltp}")
+            await MomentumEngine.close_position(stock, state, "SL")
+
+        # 3. TRAILING STOP LOSS
         else:
-            if ltp <= trade['target_price'] or ltp >= trade['sl_price']: is_exit = True
-            
-        if stock['symbol'] in state.get("manual_exits", set()): is_exit = True
-        
-        if is_exit:
-            stock['status'] = 'CLOSED'
-            state["manual_exits"].discard(stock['symbol'])
-            logger.info(f"MOMENTUM TRADE CLOSED: {stock['symbol']} at {ltp}")
-            return False # Remove from trades list
-        return True # Keep in trades list
+            tsl_ratio = float(cfg.get('trailing_sl', "1:1.5").split(':')[-1])
+            new_sl = await MomentumEngine.calculate_tsl(trade, ltp, tsl_ratio, is_bull)
+            if is_bull and new_sl > trade['sl_price']: trade['sl_price'] = new_sl
+            elif not is_bull and new_sl < trade['sl_price']: trade['sl_price'] = new_sl
+
+        # 4. MANUAL EXIT
+        if stock['symbol'] in state['manual_exits']:
+            await MomentumEngine.close_position(stock, state, "MANUAL")
+            state['manual_exits'].remove(stock['symbol'])
+
+    @staticmethod
+    async def calculate_tsl(trade: dict, ltp: float, ratio: float, is_bull: bool):
+        entry, sl = trade['entry_price'], trade['sl_price']
+        risk = abs(entry - sl)
+        profit = (ltp - entry) if is_bull else (entry - ltp)
+        if profit > (risk * ratio):
+            return round(ltp - risk, 2) if is_bull else round(ltp + risk, 2)
+        return sl
+
+    @staticmethod
+    async def close_position(stock: dict, state: dict, reason: str):
+        stock['status'] = 'WAITING'
+        stock['active_trade'] = None
+        logger.info(f"🏁 [MOM-CLOSED] {stock['symbol']} | Reason: {reason}")
