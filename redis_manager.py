@@ -2,101 +2,130 @@ import redis
 import os
 import time
 
-# --- REDIS CONNECTION SETUP ---
-# Heroku provides REDIS_URL environment variable automatically.
-# decode_responses=True ensures we get Python strings instead of bytes.
+# --- 1. REDIS CONNECTION SETUP (HEROKU SSL OPTIMIZED) ---
+# Heroku uses 'rediss://' (secure). Standard Python redis needs certificate verification disabled 
+# for Heroku's self-signed certificates.
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-r = redis.from_url(REDIS_URL, decode_responses=True)
 
-# --- LUA SCRIPT FOR ATOMIC TRADE LIMITING ---
-# This script runs inside Redis to ensure 'Check-then-Increment' is atomic.
-# This prevents race conditions where multiple signals hit at the same millisecond.
+try:
+    if REDIS_URL.startswith("rediss://"):
+        # Heroku Production Environment
+        r = redis.from_url(
+            REDIS_URL, 
+            decode_responses=True, 
+            ssl_cert_reqs=None # Critical: Bypass self-signed cert error
+        )
+    else:
+        # Local Development Environment
+        r = redis.from_url(REDIS_URL, decode_responses=True)
+except Exception as e:
+    print(f"Failed to connect to Redis: {e}")
+    r = None
+
+# --- 2. LUA SCRIPT: ATOMIC TRADE LIMITING ---
+# Yeh script Redis ke andar execute hoti hai. 
+# Iska faayda yeh hai ki "Check" aur "Increment" ke beech koi dusra signal interrupt nahi kar sakta.
+# Race conditions aur double trading se bachne ka yahi best tareeka hai.
 LUA_TRADE_LIMIT_CHECK = """
 local key = KEYS[1]
 local limit = tonumber(ARGV[1])
 local current = redis.call('get', key)
 
 if current and tonumber(current) >= limit then
-    return 0 -- Limit reached: Reject trade
+    return 0 -- Trade Reject: Limit reached
 else
     local new_val = redis.call('incr', key)
-    -- If it's a new key, set expiry to 24 hours (86400 seconds)
+    -- Naya key hai toh 24 ghante (86400s) ka expiry set karein
     if tonumber(new_val) == 1 then
         redis.call('expire', key, 86400)
     end
-    return 1 -- Success: Allow trade
+    return 1 -- Trade Allow: Within limit
 end
 """
 
 class TradeControl:
+    
+    # --- TRADE LIMITS & LUA EXECUTION ---
+    
     @staticmethod
     def can_trade(strategy_side: str, limit: int):
         """
-        Executes the Lua script to check daily limits atomically.
+        Check if a strategy (bull/bear/etc) has reached its daily trade limit.
+        Uses Atomic Lua script.
         """
-        # Key format example: limit:bull:2025-12-22
+        if not r: return False
+        
+        # Daily unique key format: limit:bull:2025-12-22
         date_str = time.strftime("%Y-%m-%d")
         key = f"limit:{strategy_side}:{date_str}"
         
         try:
-            # Register the script and execute
             lua_script = r.register_script(LUA_TRADE_LIMIT_CHECK)
             result = lua_script(keys=[key], args=[limit])
             return bool(result)
         except Exception as e:
-            # If Redis connection fails, we block trade for safety
-            print(f"Redis Error in can_trade: {e}")
+            print(f"Trade Limit Logic Error: {e}")
             return False
 
     @staticmethod
     def get_current_count(strategy_side: str):
-        """Returns the current number of trades taken today for a side."""
+        """Aaj ke liye kitne trades ho chuke hain, yeh fetch karein."""
+        if not r: return 0
         date_str = time.strftime("%Y-%m-%d")
         key = f"limit:{strategy_side}:{date_str}"
-        val = r.get(key)
-        return int(val) if val else 0
+        try:
+            val = r.get(key)
+            return int(val) if val else 0
+        except:
+            return 0
 
-    # --- CONFIG PERSISTENCE METHODS ---
-    # These functions ensure your API Keys and Access Tokens survive Heroku restarts.
+    # --- CONFIG PERSISTENCE (API KEYS & SECRETS) ---
+    # Inhe Redis mein save karne se Heroku restart par bhi API keys nahi udegi.
 
     @staticmethod
     def save_config(api_key, api_secret):
-        """Saves API Credentials to Redis."""
+        """Save credentials permanently."""
+        if not r: return False
         try:
             r.set("nexus:api_key", api_key)
             r.set("nexus:api_secret", api_secret)
             return True
         except Exception as e:
-            print(f"Failed to save config to Redis: {e}")
+            print(f"Error saving API config: {e}")
             return False
 
     @staticmethod
     def get_config():
-        """Retrieves API Credentials from Redis. Used on App Startup."""
+        """Restart ke baad API keys wapas load karne ke liye."""
+        if not r: return None, None
         try:
             api_key = r.get("nexus:api_key")
             api_secret = r.get("nexus:api_secret")
             return api_key, api_secret
         except Exception as e:
-            print(f"Failed to fetch config from Redis: {e}")
+            print(f"Error fetching API config: {e}")
             return None, None
+
+    # --- SESSION PERSISTENCE (ACCESS TOKENS) ---
+    # Access token 24 ghante tak valid rahega, bar-bar login ki zaroorat nahi.
 
     @staticmethod
     def save_access_token(token):
-        """Saves the Zerodha Access Token with a 24-hour expiry."""
+        """Save access token with 24h expiry."""
+        if not r: return False
         try:
-            # Token usually expires at market close, but 24h is safe
             r.set("nexus:access_token", token, ex=86400)
             return True
         except Exception as e:
-            print(f"Failed to save token to Redis: {e}")
+            print(f"Error saving access token: {e}")
             return False
 
     @staticmethod
     def get_access_token():
-        """Retrieves the active Zerodha Access Token from Redis."""
+        """Check if we have an active session in Redis."""
+        if not r: return None
         try:
             return r.get("nexus:access_token")
         except Exception as e:
-            print(f"Failed to fetch token from Redis: {e}")
+            print(f"Error fetching access token: {e}")
             return None
