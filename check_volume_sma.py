@@ -18,8 +18,13 @@ def check_sma_count():
     Uses scan_iter for better performance with large datasets.
     """
     try:
-        # Use from_url for production compatibility (SSL, passwords, etc. are handled)
-        r = redis.from_url(REDIS_URL, decode_responses=True)
+        # SSL FIX: Heroku Redis often uses self-signed certificates.
+        # ssl_cert_reqs=None disables certificate verification to prevent the [SSL: CERTIFICATE_VERIFY_FAILED] error.
+        r = redis.from_url(
+            REDIS_URL, 
+            decode_responses=True, 
+            ssl_cert_reqs=None
+        )
         
         # Verify connection
         r.ping()
