@@ -36,6 +36,11 @@ def check_sma_count():
 
         # Use scan_iter to prevent blocking the production Redis
         for key in r.scan_iter(KEY_PATTERN):
+            # FIX: Check the type of the key before trying to 'get' it.
+            # 'get' only works on strings. Tokens/Configs might be other types.
+            if r.type(key) != 'string':
+                continue
+
             data_raw = r.get(key)
             if not data_raw:
                 continue
@@ -44,18 +49,19 @@ def check_sma_count():
                 # Your code saves a dictionary as JSON
                 data = json.loads(data_raw)
                 
-                # In your provided code, the field name is 'sma'
-                sma_value = data.get('sma', 0)
-                symbol = data.get('symbol', 'Unknown')
-                
-                if sma_value > SMA_THRESHOLD:
-                    count += 1
-                    qualified_stocks.append(f"{symbol} ({sma_value})")
-                
-                total_scanned += 1
+                # Verify this is actually a stock data object by checking for 'sma'
+                if isinstance(data, dict) and 'sma' in data:
+                    sma_value = data.get('sma', 0)
+                    symbol = data.get('symbol', 'Unknown')
+                    
+                    if sma_value > SMA_THRESHOLD:
+                        count += 1
+                        qualified_stocks.append(f"{symbol} ({sma_value})")
+                    
+                    total_scanned += 1
                     
             except (json.JSONDecodeError, TypeError, AttributeError):
-                # Skip keys that aren't related to stock data
+                # Skip keys that aren't valid JSON stock data
                 continue
 
         # Output results
