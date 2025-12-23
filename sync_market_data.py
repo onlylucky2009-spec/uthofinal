@@ -1533,6 +1533,7 @@ async def fetch_and_sync_stock(kite, t_id, symbol, semaphore):
                 avg_vol_per_minute = total_vol / 1875
                 
                 market_data = {
+                    "symbol": symbol,
                     "sma": round(avg_vol_per_minute, 2),
                     "pdh": last_5_days[-1]['high'],
                     "pdl": last_5_days[-1]['low'],
