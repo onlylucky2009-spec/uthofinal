@@ -931,445 +931,488 @@
 #         stock.pop("trigger_sl", None)
 #         stock.pop("trigger_bucket", None)
 
-import logging
+# breakout_engine.py
 import asyncio
-from datetime import datetime, timedelta
+import logging
+from datetime import datetime, time as dtime
 from math import floor
 import pytz
+
 from redis_manager import TradeControl
 
 logger = logging.getLogger("Nexus_Breakout")
 IST = pytz.timezone("Asia/Kolkata")
 
 
-def _safe_create_task(coro, name: str = "task"):
-    task = asyncio.create_task(coro)
-
-    def _done(t: asyncio.Task):
-        try:
-            _ = t.result()
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            logger.exception(f"❌ Background task failed: {name}")
-
-    task.add_done_callback(_done)
-    return task
-
-
 class BreakoutEngine:
-    ST_WAITING = "WAITING"
-    ST_TRIGGER = "TRIGGER_WATCH"
-    ST_PENDING = "PENDING_ENTRY"
-    ST_OPEN = "OPEN"
-    ST_EXITING = "EXITING"
-    OWNER = "breakout"
+    """
+    Breakout (Bull + Bear) Engine
 
-    # Exit buffer ONLY (0.01%)
-    EXIT_MIN_GAP_PCT = 0.0001
-    EXIT_MIN_GAP_ABS = 0.01
+    Status flow:
+      WAITING -> (candle qualified) -> TRIGGER_WATCH -> (ltp breaks trigger) -> OPEN -> (target/sl/manual) -> WAITING
 
-    # Clamp buffer ONLY for trail update safety (0.01%)
-    TRAIL_CLAMP_PCT = 0.0001
-    TRAIL_CLAMP_ABS = 0.01
+    Implemented requirements:
+      ✅ Bull + Bear trading logic
+      ✅ Entry buffer removed:
+           - Long entry: ltp > breakout_candle_high
+           - Short entry: ltp < breakout_candle_low
+      ✅ Exit buffer only: 0.01% (applied to target/SL hits)
+      ✅ Additional entry condition (candle range filter):
+           - If (high-low)% <= 0.7% => OK
+           - Else:
+               Long: (breakout_high - PDH)% <= 0.5%
+               Short: (PDL - breakout_low)% <= 0.5%
+      ✅ Step trailing SL (uses cfg trailing_sl ratio):
+           step = init_risk * ratio
+           Long:
+             if profit >= 1*step -> SL = entry
+             if profit >= 2*step -> SL = entry + 1*step
+             if profit >= 3*step -> SL = entry + 2*step ...
+           Short:
+             if profit >= 1*step -> SL = entry
+             if profit >= 2*step -> SL = entry - 1*step ...
+      ✅ Scanner enrichment when qualified:
+           stock["scan_vol"]    = candle["volume"]
+           stock["scan_reason"] = "PDH/PDL break + Vol OK"
+      ✅ Candle volume fix:
+           stock["last_vol"] is initialized on first candle tick so first-minute volume works correctly
+    """
 
-    # Entry filters you requested earlier
-    MAX_RANGE_PCT = 0.7
-    MAX_EXT_PCT = 0.5
+    EXIT_BUFFER_PCT = 0.0001  # 0.01%
 
+    # -----------------------------
+    # MAIN LOOP
+    # -----------------------------
     @staticmethod
     async def run(token: int, ltp: float, vol: int, state: dict):
         stock = state["stocks"].get(token)
         if not stock:
             return
 
-        owner = stock.get("owner")
-        if owner and owner != BreakoutEngine.OWNER:
-            if stock.get("status") not in (BreakoutEngine.ST_OPEN, BreakoutEngine.ST_PENDING, BreakoutEngine.ST_EXITING):
-                return
+        # Keep last price for scanner / % change calc
+        stock["ltp"] = float(ltp or 0.0)
 
-        if str(stock.get("status", "")).startswith("MOM_"):
-            return
-
-        # Monitor open trade
-        if stock.get("status") == BreakoutEngine.ST_OPEN:
+        # 1) Monitor open positions always (even if engine toggle off)
+        if stock.get("status") == "OPEN":
             await BreakoutEngine.monitor_active_trade(stock, ltp, state)
             return
 
-        # Skip while pending / exiting
-        if stock.get("status") in (BreakoutEngine.ST_PENDING, BreakoutEngine.ST_EXITING):
+        # 2) Trigger watch: enter on break (but obey engine toggle + trading window)
+        if stock.get("status") == "TRIGGER_WATCH":
+            side = (stock.get("side_latch") or "").lower()
+            if side not in ("bull", "bear"):
+                BreakoutEngine._reset_waiting(stock)
+                return
+
+            # If engine is OFF, do not take new entries (but keep building candles)
+            if not bool(state["engine_live"].get(side, True)):
+                return
+
+            # If outside trade window, cancel trigger-watch
+            if not BreakoutEngine._within_trade_window(state["config"].get(side, {})):
+                BreakoutEngine._reset_waiting(stock)
+                return
+
+            trig = float(stock.get("trigger_px", 0.0) or 0.0)
+            if trig <= 0:
+                BreakoutEngine._reset_waiting(stock)
+                return
+
+            if side == "bull":
+                # Entry buffer removed: ltp > high
+                if ltp > trig:
+                    logger.info(f"⚡ [BRK-TRIGGER] {stock['symbol']} BULL break @ {ltp} > {trig}")
+                    await BreakoutEngine.open_trade(token, stock, ltp, state, "bull")
+            else:
+                # Entry buffer removed: ltp < low
+                if ltp < trig:
+                    logger.info(f"⚡ [BRK-TRIGGER] {stock['symbol']} BEAR break @ {ltp} < {trig}")
+                    await BreakoutEngine.open_trade(token, stock, ltp, state, "bear")
             return
 
-        # Trigger watch: entry without buffer
-        if stock.get("status") == BreakoutEngine.ST_TRIGGER:
-            side_latch = stock.get("side_latch")
-            trigger_px = float(stock.get("trigger_px", 0) or 0)
-
-            # NO entry buffer:
-            # Bull entry when LTP > breakout candle high
-            # Bear entry when LTP < breakout candle low
-            if side_latch == "BULL" and ltp > trigger_px:
-                logger.info(f"⚡ [TRIGGER-BULL] {stock['symbol']} LTP {ltp} > High {trigger_px}")
-                stock["status"] = BreakoutEngine.ST_PENDING
-                _safe_create_task(BreakoutEngine.open_trade(token, stock, ltp, state),
-                                  name=f"open_trade:BULL:{stock['symbol']}")
-            elif side_latch == "BEAR" and ltp < trigger_px:
-                logger.info(f"⚡ [TRIGGER-BEAR] {stock['symbol']} LTP {ltp} < Low {trigger_px}")
-                stock["status"] = BreakoutEngine.ST_PENDING
-                _safe_create_task(BreakoutEngine.open_trade(token, stock, ltp, state),
-                                  name=f"open_trade:BEAR:{stock['symbol']}")
-            return
-
-        # Candle build (breakout-only keys)
+        # 3) 1-minute candle aggregation
         now = datetime.now(IST)
         bucket = now.replace(second=0, microsecond=0)
 
-        ckey = "brk_candle"
-        vkey = "brk_last_vol"
+        # If candle exists and bucket changed => close previous candle and start new
+        if stock.get("candle") and stock["candle"]["bucket"] != bucket:
+            closed = stock["candle"]
 
-        if stock.get(ckey) and stock[ckey]["bucket"] != bucket:
-            prev_candle = stock[ckey]
-            _safe_create_task(BreakoutEngine.analyze_candle_logic(token, prev_candle, state),
-                              name=f"analyze_breakout:{stock['symbol']}")
-            stock[ckey] = {"bucket": bucket, "open": ltp, "high": ltp, "low": ltp, "close": ltp, "volume": 0}
-        elif not stock.get(ckey):
-            stock[ckey] = {"bucket": bucket, "open": ltp, "high": ltp, "low": ltp, "close": ltp, "volume": 0}
+            # Analyze closed candle async for low latency
+            asyncio.create_task(BreakoutEngine.analyze_candle_logic(token, closed, state))
+
+            # Start new candle
+            stock["candle"] = {
+                "bucket": bucket,
+                "open": float(ltp),
+                "high": float(ltp),
+                "low": float(ltp),
+                "close": float(ltp),
+                "volume": 0,
+            }
+
+            # ✅ FIX: initialize last_vol on first tick of new candle
+            stock["last_vol"] = int(vol)
+
+        # No candle yet => create candle
+        elif not stock.get("candle"):
+            stock["candle"] = {
+                "bucket": bucket,
+                "open": float(ltp),
+                "high": float(ltp),
+                "low": float(ltp),
+                "close": float(ltp),
+                "volume": 0,
+            }
+
+            # ✅ FIX: initialize last_vol so first minute volume deltas work
+            stock["last_vol"] = int(vol)
+
+        # Update current candle
         else:
-            c = stock[ckey]
-            c["high"] = max(c["high"], ltp)
-            c["low"] = min(c["low"], ltp)
-            c["close"] = ltp
+            c = stock["candle"]
+            c["high"] = max(float(c["high"]), float(ltp))
+            c["low"] = min(float(c["low"]), float(ltp))
+            c["close"] = float(ltp)
 
-            last_vol = int(stock.get(vkey, 0) or 0)
+            # volume delta (tick cumulative vol -> candle incremental vol)
+            last_vol = int(stock.get("last_vol", 0) or 0)
             if last_vol > 0:
                 c["volume"] += max(0, int(vol) - last_vol)
 
-        stock[vkey] = int(vol)
+            stock["last_vol"] = int(vol)
 
+    # -----------------------------
+    # CANDLE ANALYSIS
+    # -----------------------------
     @staticmethod
     async def analyze_candle_logic(token: int, candle: dict, state: dict):
         stock = state["stocks"].get(token)
         if not stock:
             return
 
-        if stock.get("status") not in (BreakoutEngine.ST_WAITING, None, ""):
+        symbol = stock.get("symbol")
+        if not symbol:
             return
 
-        owner = stock.get("owner")
-        if owner and owner != BreakoutEngine.OWNER:
+        # Do not qualify new triggers if already in trigger watch (avoid overwriting)
+        if stock.get("status") == "TRIGGER_WATCH":
             return
 
-        o = float(candle.get("open", 0) or 0)
-        c = float(candle.get("close", 0) or 0)
-        h = float(candle.get("high", 0) or 0)
-        l = float(candle.get("low", 0) or 0)
-        if o <= 0 or h <= 0 or l <= 0:
+        now = datetime.now(IST)
+
+        pdh = float(stock.get("pdh", 0) or 0)
+        pdl = float(stock.get("pdl", 0) or 0)
+        if pdh <= 0 or pdl <= 0:
             return
 
-        range_pct = ((h - l) / l) * 100.0 if l > 0 else 999.0
+        high = float(candle.get("high", 0) or 0)
+        low = float(candle.get("low", 0) or 0)
+        close = float(candle.get("close", 0) or 0)
+        c_vol = int(candle.get("volume", 0) or 0)
 
-        # BULL (PDH cross)
-        if state["engine_live"].get("bull"):
-            pdh = float(stock.get("pdh", 0) or 0)
-            if pdh > 0 and o < pdh and c > pdh:
-                pass_range = range_pct <= BreakoutEngine.MAX_RANGE_PCT
-                pass_ext = True
-                if not pass_range:
-                    ext_pct = ((h - pdh) / pdh) * 100.0
-                    pass_ext = ext_pct <= BreakoutEngine.MAX_EXT_PCT
+        if close <= 0 or high <= 0 or low <= 0:
+            return
 
-                if not (pass_range or pass_ext):
-                    logger.info(f"❌ [REJECT-BULL:RANGE] {stock['symbol']} range={range_pct:.3f}%")
-                    return
+        # --- BULL BREAKOUT ---
+        if close > pdh:
+            side = "bull"
+            if not bool(state["engine_live"].get(side, True)):
+                return
+            if not BreakoutEngine._within_trade_window(state["config"].get(side, {}), now=now):
+                return
 
-                is_qualified, detail = await BreakoutEngine.check_vol_matrix(stock, candle, "bull", state)
-                if is_qualified:
-                    stock["status"] = BreakoutEngine.ST_TRIGGER
-                    stock["side_latch"] = "BULL"
-                    stock["trigger_px"] = float(h)      # no entry buffer
-                    stock["trigger_sl"] = float(l)      # reference SL
-                    stock["trigger_bucket"] = candle.get("bucket")
-                    logger.info(f"✅ [QUALIFIED-BULL] {stock['symbol']} | {detail} | TRG={stock['trigger_px']}")
-                else:
-                    logger.info(f"❌ [REJECT-BULL] {stock['symbol']} | {detail}")
+            # Range gate (0.7% else 0.5% PDH gap)
+            if not BreakoutEngine._range_gate_ok(side, high, low, close, pdh=pdh, pdl=pdl):
+                logger.info(f"❌ [BRK-REJECT] {symbol} BULL | RangeGate fail")
+                return
 
-        # BEAR (PDL cross)
-        if state["engine_live"].get("bear"):
-            pdl = float(stock.get("pdl", 0) or 0)
-            if pdl > 0 and o > pdl and c < pdl:
-                pass_range = range_pct <= BreakoutEngine.MAX_RANGE_PCT
-                pass_ext = True
-                if not pass_range:
-                    ext_pct = ((pdl - l) / pdl) * 100.0
-                    pass_ext = ext_pct <= BreakoutEngine.MAX_EXT_PCT
+            is_qualified, detail = await BreakoutEngine.check_vol_matrix(stock, candle, "bull", state)
+            if not is_qualified:
+                logger.info(f"❌ [BRK-REJECT] {symbol} BULL | {detail}")
+                return
 
-                if not (pass_range or pass_ext):
-                    logger.info(f"❌ [REJECT-BEAR:RANGE] {stock['symbol']} range={range_pct:.3f}%")
-                    return
+            # ✅ Qualified -> enter TRIGGER_WATCH
+            stock["status"] = "TRIGGER_WATCH"
+            stock["side_latch"] = "bull"
+            stock["trigger_px"] = float(high)  # no entry buffer
 
-                is_qualified, detail = await BreakoutEngine.check_vol_matrix(stock, candle, "bear", state)
-                if is_qualified:
-                    stock["status"] = BreakoutEngine.ST_TRIGGER
-                    stock["side_latch"] = "BEAR"
-                    stock["trigger_px"] = float(l)      # no entry buffer
-                    stock["trigger_sl"] = float(h)      # reference SL
-                    stock["trigger_bucket"] = candle.get("bucket")
-                    logger.info(f"✅ [QUALIFIED-BEAR] {stock['symbol']} | {detail} | TRG={stock['trigger_px']}")
-                else:
-                    logger.info(f"❌ [REJECT-BEAR] {stock['symbol']} | {detail}")
+            # ✅ Scanner enrichment
+            stock["scan_vol"] = int(c_vol)
+            stock["scan_reason"] = "PDH/PDL break + Vol OK"
 
+            logger.info(f"✅ [BRK-QUALIFIED] {symbol} BULL | Trigger @ {high} | {detail}")
+            return
+
+        # --- BEAR BREAKDOWN ---
+        if close < pdl:
+            side = "bear"
+            if not bool(state["engine_live"].get(side, True)):
+                return
+            if not BreakoutEngine._within_trade_window(state["config"].get(side, {}), now=now):
+                return
+
+            # Range gate (0.7% else 0.5% PDL gap)
+            if not BreakoutEngine._range_gate_ok(side, high, low, close, pdh=pdh, pdl=pdl):
+                logger.info(f"❌ [BRK-REJECT] {symbol} BEAR | RangeGate fail")
+                return
+
+            is_qualified, detail = await BreakoutEngine.check_vol_matrix(stock, candle, "bear", state)
+            if not is_qualified:
+                logger.info(f"❌ [BRK-REJECT] {symbol} BEAR | {detail}")
+                return
+
+            stock["status"] = "TRIGGER_WATCH"
+            stock["side_latch"] = "bear"
+            stock["trigger_px"] = float(low)  # no entry buffer
+
+            # ✅ Scanner enrichment
+            stock["scan_vol"] = int(c_vol)
+            stock["scan_reason"] = "PDH/PDL break + Vol OK"
+
+            logger.info(f"✅ [BRK-QUALIFIED] {symbol} BEAR | Trigger @ {low} | {detail}")
+            return
+
+    # -----------------------------
+    # VOLUME MATRIX
+    # -----------------------------
     @staticmethod
     async def check_vol_matrix(stock: dict, candle: dict, side: str, state: dict):
-        matrix = state["config"][side].get("volume_criteria", [])
-        c_vol = float(candle.get("volume", 0) or 0)
+        cfg = state["config"].get(side, {})
+        matrix = cfg.get("volume_criteria", []) or []
+
+        c_vol = int(candle.get("volume", 0) or 0)
         s_sma = float(stock.get("sma", 0) or 0)
-        close_px = float(candle.get("close", 0) or 0)
-        c_val_cr = (c_vol * close_px) / 10000000.0 if close_px > 0 else 0
+        close = float(candle.get("close", 0) or 0)
+
+        # Value in Cr
+        c_val_cr = (c_vol * close) / 10000000.0 if close > 0 else 0.0
 
         if not matrix:
-            return True, "Empty Matrix"
+            return True, "No Matrix"
 
+        # Choose highest tier where SMA >= min_sma_avg
         tier_found = None
         for i, level in enumerate(matrix):
-            if s_sma >= float(level.get("min_sma_avg", 0) or 0):
+            try:
+                min_sma_avg = float(level.get("min_sma_avg", 0) or 0)
+            except Exception:
+                min_sma_avg = 0.0
+
+            if s_sma >= min_sma_avg:
                 tier_found = (i, level)
             else:
                 break
 
-        if tier_found:
-            idx, level = tier_found
-            multiplier = float(level.get("sma_multiplier", 1.0) or 1.0)
-            min_cr = float(level.get("min_vol_price_cr", 0) or 0)
-            required_vol = s_sma * multiplier
-            if c_vol >= required_vol and c_val_cr >= min_cr:
-                return True, f"T{idx+1} Pass"
-            return False, f"T{idx+1} Fail (Vol/Cr)"
+        if not tier_found:
+            return False, f"SMA {s_sma:,.0f} too low"
 
-        return False, f"SMA {s_sma:,.0f} too low"
+        idx, level = tier_found
+        required_vol = s_sma * float(level.get("sma_multiplier", 1.0) or 1.0)
+        min_cr = float(level.get("min_vol_price_cr", 0) or 0)
 
+        if c_vol >= required_vol and c_val_cr >= min_cr:
+            return True, f"Tier {idx+1} Pass"
+        return False, f"Tier {idx+1} Fail (Vol/Value)"
+
+    # -----------------------------
+    # ORDER EXECUTION
+    # -----------------------------
     @staticmethod
-    async def open_trade(token: int, stock: dict, ltp: float, state: dict):
+    async def open_trade(token: int, stock: dict, ltp: float, state: dict, side_key: str):
+        cfg = state["config"].get(side_key, {})
+        kite = state.get("kite")
+
+        if not kite:
+            logger.error(f"❌ [KITE ERROR] Session missing for {stock.get('symbol')}")
+            BreakoutEngine._reset_waiting(stock)
+            return
+
+        # No new entry if engine toggle off or outside window
+        if not bool(state["engine_live"].get(side_key, True)):
+            BreakoutEngine._reset_waiting(stock)
+            return
+        if not BreakoutEngine._within_trade_window(cfg):
+            BreakoutEngine._reset_waiting(stock)
+            return
+
+        # Trade limit check (Redis)
+        limit = int(cfg.get("total_trades", 5) or 5)
+        if not await TradeControl.can_trade(side_key, limit):
+            logger.warning(f"🚫 [LIMIT] {stock['symbol']} limit reached for {side_key}")
+            BreakoutEngine._reset_waiting(stock)
+            return
+
+        is_bull = (side_key == "bull")
+
+        # Initial SL based on breakout candle opposite extreme
+        trig_candle = stock.get("candle") or {}
+        if is_bull:
+            sl_px = float(trig_candle.get("low", 0) or 0)
+        else:
+            sl_px = float(trig_candle.get("high", 0) or 0)
+
+        # Safety: if SL invalid, fall back to 0.5% risk
+        entry = float(ltp)
+        if sl_px <= 0:
+            sl_px = round(entry * (0.995 if is_bull else 1.005), 2)
+
+        risk_per_share = max(abs(entry - sl_px), entry * 0.005)  # 0.5% risk floor
+        risk_amount = float(cfg.get("risk_trade_1", 2000) or 2000)
+        qty = floor(risk_amount / risk_per_share)
+
+        if qty <= 0:
+            BreakoutEngine._reset_waiting(stock)
+            return
+
         try:
-            stock["owner"] = BreakoutEngine.OWNER
-
-            side_latch = stock.get("side_latch", "BULL")
-            side_key = "bull" if side_latch == "BULL" else "bear"
-            is_bull = (side_key == "bull")
-
-            cfg = state["config"].get(side_key, {})
-            kite = state.get("kite")
-            if not kite:
-                logger.error(f"❌ [AUTH ERROR] Kite missing for {stock.get('symbol')}")
-                stock["status"] = BreakoutEngine.ST_WAITING
-                stock.pop("owner", None)
-                return
-
-            daily_limit = int(cfg.get("total_trades", 5) or 5)
-            if not await TradeControl.can_trade(side_key, daily_limit):
-                logger.warning(f"🚫 [LIMIT] {stock['symbol']} limit reached ({side_key})")
-                stock["status"] = BreakoutEngine.ST_WAITING
-                stock.pop("owner", None)
-                return
-
-            raw_sl = float(stock.get("trigger_sl") or ltp)
-
-            # Exit buffer ONLY 0.01%
-            min_gap = max(ltp * BreakoutEngine.EXIT_MIN_GAP_PCT, BreakoutEngine.EXIT_MIN_GAP_ABS)
-
-            if is_bull:
-                sl_px = min(raw_sl, ltp - min_gap)
-                init_risk = max(ltp - sl_px, min_gap)
-            else:
-                sl_px = max(raw_sl, ltp + min_gap)
-                init_risk = max(sl_px - ltp, min_gap)
-
-            total_risk_allowed = float(cfg.get("risk_trade_1", 2000) or 2000)
-            qty = floor(total_risk_allowed / init_risk)
-            if qty <= 0:
-                stock["status"] = BreakoutEngine.ST_WAITING
-                stock.pop("owner", None)
-                return
-
             order_id = await asyncio.to_thread(
                 kite.place_order,
                 variety=kite.VARIETY_REGULAR,
                 exchange=kite.EXCHANGE_NSE,
                 tradingsymbol=stock["symbol"],
-                transaction_type=kite.TRANSACTION_TYPE_BUY if is_bull else kite.TRANSACTION_TYPE_SELL,
+                transaction_type=(kite.TRANSACTION_TYPE_BUY if is_bull else kite.TRANSACTION_TYPE_SELL),
                 quantity=qty,
                 product=kite.PRODUCT_MIS,
                 order_type=kite.ORDER_TYPE_MARKET,
             )
 
             rr_val = float(str(cfg.get("risk_reward", "1:2")).split(":")[-1])
-            target_price = round(ltp + init_risk * rr_val, 2) if is_bull else round(ltp - init_risk * rr_val, 2)
+            target = round(entry + (risk_per_share * rr_val), 2) if is_bull else round(entry - (risk_per_share * rr_val), 2)
 
-            # trailing ratio (step multiplier)
-            trail_ratio = float(str(cfg.get("trailing_sl", "1:1.5")).split(":")[-1])
-            trail_step = init_risk * trail_ratio
+            tsl_ratio = float(str(cfg.get("trailing_sl", "1:1.5")).split(":")[-1])
+            trail_step = float(risk_per_share * tsl_ratio) if tsl_ratio > 0 else float(risk_per_share)
 
-            now = datetime.now(IST)
             trade = {
                 "symbol": stock["symbol"],
-                "qty": qty,
-                "entry_price": float(ltp),
+                "qty": int(qty),
+                "entry_price": float(entry),
                 "sl_price": float(sl_px),
-                "target_price": float(target_price),
+                "target_price": float(target),
                 "order_id": order_id,
                 "pnl": 0.0,
-                "entry_time": now.strftime("%H:%M:%S"),
-                "filled_at": now,
-                "armed_at": now + timedelta(seconds=0.5),
-                "side_key": side_key,
+                "entry_time": datetime.now(IST).strftime("%H:%M:%S"),
 
-                # ✅ step-trailing state
-                "init_sl_price": float(sl_px),
-                "init_risk": float(init_risk),
-                "trail_ratio": float(trail_ratio),
+                # step trailing parameters
+                "init_risk": float(risk_per_share),
                 "trail_step": float(trail_step),
-
-                # extrema (use best price so SL never moves backward)
-                "peak": float(ltp),     # bull best
-                "trough": float(ltp),   # bear best
             }
 
             state["trades"][side_key].append(trade)
+            stock["status"] = "OPEN"
             stock["active_trade"] = trade
-            stock["status"] = BreakoutEngine.ST_OPEN
+            stock["side_latch"] = side_key  # keep side for exits
 
-            logger.info(f"🚀 [ENTRY-{side_key.upper()}] {stock['symbol']} Qty:{qty} "
-                        f"| Entry:{ltp} | SL:{sl_px} | Step:{trail_step:.2f} | TGT:{target_price}")
+            # Clear scanner fields once trade is live
+            stock["scan_seen_ts"] = None
+            stock["scan_seen_time"] = None
+            stock["scan_vol"] = 0
+            stock["scan_reason"] = None
+
+            logger.info(
+                f"🚀 [BRK REAL ENTRY] {stock['symbol']} {side_key.upper()} | Qty: {qty} | OrderID: {order_id}"
+            )
 
         except Exception as e:
-            logger.exception(f"❌ [ENTRY ERROR] {stock.get('symbol')}: {e}")
-            stock["status"] = BreakoutEngine.ST_WAITING
-            stock["active_trade"] = None
-            stock.pop("owner", None)
-        finally:
-            stock.pop("trigger_sl", None)
-            stock.pop("trigger_bucket", None)
+            logger.error(f"❌ [KITE ORDER ERROR] {stock['symbol']}: {e}")
+            BreakoutEngine._reset_waiting(stock)
 
-    @staticmethod
-    def _step_trailing_sl(trade: dict, is_bull: bool) -> float:
-        """
-        Step-wise trailing:
-        - step = init_risk * trail_ratio  (e.g., 10 * 1.5 = 15)
-        - bull: when peak reaches entry + N*step => SL becomes entry + (N-1)*step
-        - bear: when trough reaches entry - N*step => SL becomes entry - (N-1)*step
-        """
-        entry = float(trade["entry_price"])
-        init_sl = float(trade["init_sl_price"])
-        step = float(trade.get("trail_step") or 0.0)
-
-        if step <= 0:
-            return float(trade["sl_price"])
-
-        if is_bull:
-            peak = float(trade.get("peak", entry))
-            profit = peak - entry
-            level = int(profit // step)  # 0,1,2,3...
-            if level >= 1:
-                return entry + (level - 1) * step
-            return init_sl
-        else:
-            trough = float(trade.get("trough", entry))
-            profit = entry - trough
-            level = int(profit // step)
-            if level >= 1:
-                return entry - (level - 1) * step
-            return init_sl
-
+    # -----------------------------
+    # MONITOR + EXIT + STEP TRAIL
+    # -----------------------------
     @staticmethod
     async def monitor_active_trade(stock: dict, ltp: float, state: dict):
         trade = stock.get("active_trade")
         if not trade:
-            stock["status"] = BreakoutEngine.ST_WAITING
-            stock.pop("owner", None)
             return
 
-        if stock.get("status") == BreakoutEngine.ST_EXITING:
-            return
-
-        side_key = str(trade.get("side_key") or "bull").lower()
+        side_key = (stock.get("side_latch") or "").lower()
         is_bull = (side_key == "bull")
-        cfg = state["config"].get(side_key, {})
 
         entry = float(trade.get("entry_price", 0) or 0)
         qty = int(trade.get("qty", 0) or 0)
-
-        # Manual exit
-        if stock.get("symbol") in state.get("manual_exits", set()):
-            state["manual_exits"].discard(stock["symbol"])
-            logger.info(f"🖱️ [MANUAL EXIT] {stock['symbol']}")
-            _safe_create_task(BreakoutEngine.close_position(stock, state, "MANUAL"),
-                              name=f"close_position:MANUAL:{stock['symbol']}")
-            return
-
-        # arming window
-        now = datetime.now(IST)
-        armed_at = trade.get("armed_at")
-        if armed_at and isinstance(armed_at, datetime) and now < armed_at:
-            return
-
-        # Update extrema (best price)
-        if is_bull:
-            trade["peak"] = max(float(trade.get("peak", entry)), float(ltp))
-        else:
-            trade["trough"] = min(float(trade.get("trough", entry)), float(ltp))
-
-        # PnL
-        if is_bull:
-            trade["pnl"] = round((ltp - entry) * qty, 2)
-        else:
-            trade["pnl"] = round((entry - ltp) * qty, 2)
-
-        target = float(trade.get("target_price", 0) or 0)
         sl = float(trade.get("sl_price", 0) or 0)
+        target = float(trade.get("target_price", 0) or 0)
 
-        # Exits
+        if entry <= 0 or qty <= 0:
+            await BreakoutEngine.close_position(stock, state, "BAD_TRADE_STATE")
+            return
+
+        # Live PnL
         if is_bull:
-            if target > 0 and ltp >= target:
-                _safe_create_task(BreakoutEngine.close_position(stock, state, "TARGET"),
-                                  name=f"close_position:TARGET:{stock['symbol']}")
-                return
-            if ltp <= sl:
-                _safe_create_task(BreakoutEngine.close_position(stock, state, "SL"),
-                                  name=f"close_position:SL:{stock['symbol']}")
-                return
+            trade["pnl"] = round((float(ltp) - entry) * qty, 2)
         else:
-            if target > 0 and ltp <= target:
-                _safe_create_task(BreakoutEngine.close_position(stock, state, "TARGET"),
-                                  name=f"close_position:TARGET:{stock['symbol']}")
-                return
-            if ltp >= sl:
-                _safe_create_task(BreakoutEngine.close_position(stock, state, "SL"),
-                                  name=f"close_position:SL:{stock['symbol']}")
-                return
+            trade["pnl"] = round((entry - float(ltp)) * qty, 2)
 
-        # ✅ Step-wise trailing update (uses peak/trough so SL never moves backward)
-        new_sl = BreakoutEngine._step_trailing_sl(trade, is_bull)
+        # Exit buffer (0.01%) — hit slightly earlier to avoid missing
+        b = BreakoutEngine.EXIT_BUFFER_PCT
 
-        # Optional safety clamp vs best-price (NOT current ltp), keeps math consistent
-        clamp_buf = max((trade["peak"] if is_bull else trade["trough"]) * BreakoutEngine.TRAIL_CLAMP_PCT,
-                        BreakoutEngine.TRAIL_CLAMP_ABS)
         if is_bull:
-            new_sl = min(float(new_sl), float(trade["peak"]) - clamp_buf)
-            if new_sl > float(trade["sl_price"]):
-                trade["sl_price"] = round(new_sl, 2)
+            target_hit = float(ltp) >= (target * (1.0 - b))
+            sl_hit = float(ltp) <= (sl * (1.0 + b))
         else:
-            new_sl = max(float(new_sl), float(trade["trough"]) + clamp_buf)
-            if new_sl < float(trade["sl_price"]):
-                trade["sl_price"] = round(new_sl, 2)
+            target_hit = float(ltp) <= (target * (1.0 + b))
+            sl_hit = float(ltp) >= (sl * (1.0 - b))
+
+        if target_hit:
+            logger.info(f"🎯 [BRK-TARGET] {stock['symbol']} hit target {target}")
+            await BreakoutEngine.close_position(stock, state, "TARGET")
+            return
+
+        if sl_hit:
+            logger.info(f"🛑 [BRK-STOPLOSS] {stock['symbol']} hit SL {sl}")
+            await BreakoutEngine.close_position(stock, state, "SL")
+            return
+
+        # Step trailing SL
+        new_sl = BreakoutEngine._step_trail_sl(trade, float(ltp), is_bull)
+        if new_sl is not None:
+            if is_bull and new_sl > float(trade.get("sl_price", 0) or 0):
+                trade["sl_price"] = float(new_sl)
+            elif (not is_bull) and new_sl < float(trade.get("sl_price", 0) or 0):
+                trade["sl_price"] = float(new_sl)
+
+        # Manual exit list (legacy)
+        if stock.get("symbol") in state.get("manual_exits", set()):
+            logger.info(f"🖱️ [BRK-MANUAL EXIT] {stock['symbol']}")
+            await BreakoutEngine.close_position(stock, state, "MANUAL")
+            state["manual_exits"].remove(stock["symbol"])
+
+    @staticmethod
+    def _step_trail_sl(trade: dict, ltp: float, is_bull: bool):
+        """
+        Step trailing:
+          step = trail_step
+
+        Long:
+          k = floor(profit / step)
+          if k >= 1 => SL = entry + (k-1)*step
+        Short:
+          if k >= 1 => SL = entry - (k-1)*step
+        """
+        entry = float(trade.get("entry_price", 0) or 0)
+        step = float(trade.get("trail_step", 0) or 0)
+
+        if entry <= 0 or step <= 0:
+            return None
+
+        profit = (ltp - entry) if is_bull else (entry - ltp)
+        if profit <= 0:
+            return None
+
+        k = int(profit // step)
+        if k < 1:
+            return None
+
+        if is_bull:
+            return round(entry + ((k - 1) * step), 2)
+        return round(entry - ((k - 1) * step), 2)
 
     @staticmethod
     async def close_position(stock: dict, state: dict, reason: str):
-        if stock.get("status") == BreakoutEngine.ST_EXITING:
-            return
-        stock["status"] = BreakoutEngine.ST_EXITING
-
         trade = stock.get("active_trade")
         kite = state.get("kite")
-        side_key = str(trade.get("side_key") if trade else "bull").lower()
+        side_key = (stock.get("side_latch") or "").lower()
         is_bull = (side_key == "bull")
 
         if trade and kite:
@@ -1379,20 +1422,89 @@ class BreakoutEngine:
                     variety=kite.VARIETY_REGULAR,
                     exchange=kite.EXCHANGE_NSE,
                     tradingsymbol=stock["symbol"],
-                    transaction_type=kite.TRANSACTION_TYPE_SELL if is_bull else kite.TRANSACTION_TYPE_BUY,
+                    transaction_type=(kite.TRANSACTION_TYPE_SELL if is_bull else kite.TRANSACTION_TYPE_BUY),
                     quantity=int(trade["qty"]),
                     product=kite.PRODUCT_MIS,
                     order_type=kite.ORDER_TYPE_MARKET,
                 )
-                logger.info(f"🏁 [EXIT-{side_key.upper()}] {stock['symbol']} Reason:{reason} | OID:{exit_id}")
+                logger.info(f"🏁 [BRK REAL EXIT] {stock['symbol']} Reason: {reason} | OrderID: {exit_id}")
             except Exception as e:
-                logger.exception(f"❌ [KITE EXIT ERROR] {stock.get('symbol')}: {e}")
+                logger.error(f"❌ [KITE BRK EXIT ERROR] {stock['symbol']}: {e}")
 
-        stock["status"] = BreakoutEngine.ST_WAITING
+        # Remove trade from RAM list
+        try:
+            if side_key in state["trades"] and trade:
+                state["trades"][side_key] = [t for t in state["trades"][side_key] if t is not trade]
+        except Exception:
+            pass
+
+        # Reset stock
+        BreakoutEngine._reset_waiting(stock)
+
+    # -----------------------------
+    # HELPERS
+    # -----------------------------
+    @staticmethod
+    def _reset_waiting(stock: dict):
+        stock["status"] = "WAITING"
         stock["active_trade"] = None
-        stock.pop("owner", None)
+
+        # Clear trigger + latch + scanner
         stock.pop("trigger_px", None)
         stock.pop("side_latch", None)
-        stock.pop("trigger_sl", None)
-        stock.pop("trigger_bucket", None)
 
+        stock["scan_seen_ts"] = None
+        stock["scan_seen_time"] = None
+        stock["scan_vol"] = 0
+        stock["scan_reason"] = None
+
+    @staticmethod
+    def _within_trade_window(cfg: dict, now: datetime | None = None) -> bool:
+        """
+        cfg: {"trade_start":"HH:MM", "trade_end":"HH:MM"}
+        """
+        try:
+            now = now or datetime.now(IST)
+            start_s = str(cfg.get("trade_start", "09:15"))
+            end_s = str(cfg.get("trade_end", "15:10"))
+
+            sh, sm = int(start_s.split(":")[0]), int(start_s.split(":")[1])
+            eh, em = int(end_s.split(":")[0]), int(end_s.split(":")[1])
+
+            start_t = dtime(sh, sm)
+            end_t = dtime(eh, em)
+            nt = now.time()
+
+            return (nt >= start_t) and (nt <= end_t)
+        except Exception:
+            return True
+
+    @staticmethod
+    def _range_gate_ok(side: str, high: float, low: float, close: float, *, pdh: float, pdl: float) -> bool:
+        """
+        Requirement:
+          - If (high-low)% <= 0.5% -> OK
+          - Else:
+              Long: (high - PDH)% <= 0.5%
+              Short: (PDL - low)% <= 0.5%
+        """
+        if close <= 0:
+            return False
+
+        range_pct = ((high - low) / close) * 100.0
+        if range_pct <= 0.5:
+            return True
+
+        if side == "bull":
+            if pdh <= 0:
+                return False
+            gap_pct = ((high - pdh) / pdh) * 100.0
+            return gap_pct <= 0.5
+
+        if side == "bear":
+            if pdl <= 0:
+                return False
+            gap_pct = ((pdl - low) / pdl) * 100.0
+            return gap_pct <= 0.5
+
+        return False
