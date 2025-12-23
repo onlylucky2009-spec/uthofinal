@@ -388,7 +388,8 @@ class BreakoutEngine:
                 logger.info(f"✅ [QUALIFIED] {stock['symbol']} | {detail}")
                 stock["status"] = BreakoutEngine.ST_TRIGGER
                 stock["side_latch"] = "BULL"
-                stock["trigger_px"] = round(float(candle["high"]) * 1.0005, 2)
+                # stock["trigger_px"] = round(float(candle["high"]) * 1.0005, 2)
+                stock['trigger_px'] = float(candle['high'])
 
                 # ✅ Store reference SL from the qualifying candle (not a future candle)
                 stock["trigger_sl"] = float(candle["low"])
@@ -459,7 +460,7 @@ class BreakoutEngine:
 
             # 2) SL from qualifying candle, with hard clamp below entry (prevents immediate exit)
             raw_sl = float(stock.get("trigger_sl") or ltp)
-            min_gap = max(ltp * 0.002, 0.10)   # 0.2% or 10p
+            min_gap = max(ltp * 0.0001, 0.01)   # 0.2% or 10p
             sl_px = min(raw_sl, ltp - min_gap)  # ALWAYS below entry
 
             risk_per_share = max(ltp - sl_px, min_gap)
