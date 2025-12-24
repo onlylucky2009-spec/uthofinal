@@ -1,472 +1,387 @@
 import asyncio
 import logging
+import os
 from datetime import datetime
 from math import floor
-from typing import Optional
-import pytz
+from typing import Optional, Tuple
 
-from redis_manager import TradeControl
+from redis_manager import TradeControl, IST
 
+# --- LOGGING SETUP ---
+# Engine ke har step ko track karne ke liye detailed logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("Nexus_Breakout")
-IST = pytz.timezone("Asia/Kolkata")
-
 
 class BreakoutEngine:
     """
-    Breakout Engine (Bull/Bear)
-
-    Fixes implemented:
-      ✅ Uses per-engine keys (brk_*) to avoid collision with MomentumEngine
-      ✅ Trigger watch TTL = 6 minutes (per symbol)
-      ✅ Per-symbol trades/day cap = 2 (Redis, survives restart)
-      ✅ 2nd trade only after 1st closed (Redis open-lock)
-      ✅ Side limit total_trades is atomic & rollback-safe
-      ✅ Trades are marked CLOSED (not removed) so PnL stays correct
-      ✅ Candle logic is called from main tick_worker on candle-close
+    Advanced Breakout Engine (Bull/Bear)
+    -----------------------------------
+    ✅ 0.7% Candle Range Gate (Volatility Filter)
+    ✅ 0.5% Gap Check (Extended Entry Filter)
+    ✅ 10-Tier Volume SMA Matrix
+    ✅ Strict Directional Latch (Buy/Short Fix)
+    ✅ Heroku/Redis Atomic Locking
     """
 
-    EXIT_BUFFER_PCT = 0.0001
-    TRIGGER_VALID_SECONDS = 6 * 60
     MAX_TRADES_PER_SYMBOL = 2
+    TRIGGER_VALID_SECONDS = 6 * 60  # Trigger 6 minute tak valid rahega
 
-    # -----------------------------
-    # TICK HANDLER (no candle aggregation here)
-    # -----------------------------
+    # --- CORE TICK HANDLER ---
     @staticmethod
     async def run(token: int, ltp: float, vol: int, state: dict):
+        """
+        Har tick par chalta hai. 
+        Positions monitor karta hai aur trigger watch karta hai.
+        """
         stock = state["stocks"].get(token)
         if not stock:
             return
 
+        # LTP update karna zaroori hai real-time PnL ke liye
         stock["ltp"] = float(ltp or 0.0)
+        status = stock.get("brk_status", "WAITING")
 
-        brk_status = stock.get("brk_status", "WAITING")
-
-        # monitor open trade regardless of engine toggle
-        if brk_status == "OPEN":
+        # 1. Agar position OPEN hai toh monitor karo
+        if status == "OPEN":
             await BreakoutEngine.monitor_active_trade(stock, ltp, state)
             return
 
-        # trigger watch
-        if brk_status == "TRIGGER_WATCH":
+        # 2. Agar TRIGGER_WATCH mein hai toh entry check karo
+        if status == "TRIGGER_WATCH":
             side = (stock.get("brk_side_latch") or "").lower()
+            
+            # Basic validation
             if side not in ("bull", "bear"):
                 BreakoutEngine._reset_waiting(stock)
                 return
 
-            # TTL
-            now_ts = int(datetime.now(IST).timestamp())
-            set_ts = int(stock.get("brk_trigger_set_ts") or 0)
-            if set_ts and (now_ts - set_ts) > BreakoutEngine.TRIGGER_VALID_SECONDS:
-                logger.info(f"⏳ [BRK-EXPIRE] {stock.get('symbol')} {side.upper()} trigger expired (>6m).")
+            # Trigger Expiry check (6 minutes)
+            now_ts = datetime.now(IST).timestamp()
+            set_ts = float(stock.get("brk_set_ts") or 0)
+            if (now_ts - set_ts) > BreakoutEngine.TRIGGER_VALID_SECONDS:
+                logger.info(f"⏳ [BRK] {stock['symbol']} trigger expire ho gaya.")
                 BreakoutEngine._reset_waiting(stock)
                 return
 
-            # engine toggle gates new entry only
-            if not bool(state["engine_live"].get(side, True)):
+            # Dashboard toggle check
+            if not state["engine_live"].get(side, True):
                 return
 
-            # trade window gate
+            # Time Window check
             if not BreakoutEngine._within_trade_window(state["config"].get(side, {})):
                 BreakoutEngine._reset_waiting(stock)
                 return
 
-            trig = float(stock.get("brk_trigger_px", 0.0) or 0.0)
-            if trig <= 0:
-                BreakoutEngine._reset_waiting(stock)
-                return
+            trigger_px = float(stock.get("brk_trigger_px", 0.0))
 
-            if side == "bull" and ltp > trig:
+            # --- EXECUTION WITH DIRECTIONAL SAFETY ---
+            # Side latch ensure karta hai ki direction galat na ho
+            if side == "bull" and ltp > trigger_px:
                 await BreakoutEngine.open_trade(stock, ltp, state, "bull")
-            elif side == "bear" and ltp < trig:
+            elif side == "bear" and ltp < trigger_px:
                 await BreakoutEngine.open_trade(stock, ltp, state, "bear")
+            
             return
 
-    # -----------------------------
-    # CANDLE-CLOSE QUALIFICATION (called by main.py)
-    # -----------------------------
+    # --- CANDLE QUALIFICATION (1m Close) ---
     @staticmethod
     async def on_candle_close(token: int, candle: dict, state: dict):
+        """
+        Jab 1-minute candle close hoti hai tab main.py isse call karta hai.
+        Yahan 0.7% aur 0.5% filters check hote hain.
+        """
         stock = state["stocks"].get(token)
-        if not stock:
-            return
+        if not stock: return
 
-        symbol = stock.get("symbol")
-        if not symbol:
-            return
-
-        # Do not qualify if breakout already has open/trigger watch
+        # Agar pehle se trade mein hai ya trigger watch kar raha hai toh skip
         if stock.get("brk_status") in ("OPEN", "TRIGGER_WATCH"):
             return
 
-        # If any engine has open lock for symbol in Redis, you still *can* qualify,
-        # but entry will be blocked. Keeping it simple: qualify allowed.
-        # (If you want: skip qualification when a position is open elsewhere.)
+        symbol = stock.get("symbol")
+        pdh = float(stock.get("pdh", 0))
+        pdl = float(stock.get("pdl", 0))
+        c_close = float(candle.get("close", 0))
+        c_high = float(candle.get("high", 0))
+        c_low = float(candle.get("low", 0))
 
-        # Per-symbol cap check (Redis)
-        taken = await TradeControl.get_symbol_trade_count(symbol)
-        if taken >= BreakoutEngine.MAX_TRADES_PER_SYMBOL:
-            return
-
-        pdh = float(stock.get("pdh", 0) or 0)
-        pdl = float(stock.get("pdl", 0) or 0)
         if pdh <= 0 or pdl <= 0:
             return
 
-        high = float(candle.get("high", 0) or 0)
-        low = float(candle.get("low", 0) or 0)
-        close = float(candle.get("close", 0) or 0)
-        c_vol = int(candle.get("volume", 0) or 0)
-        if close <= 0 or high <= 0 or low <= 0:
-            return
-
-        now = datetime.now(IST)
-
-        # BULL
-        if close > pdh:
+        # 1. BULL QUALIFICATION (PDH Breakout)
+        if c_close > pdh:
             side = "bull"
-            if not bool(state["engine_live"].get(side, True)):
-                return
-            if not BreakoutEngine._within_trade_window(state["config"].get(side, {}), now=now):
-                return
-            if not BreakoutEngine._range_gate_ok(side, high, low, close, pdh=pdh, pdl=pdl):
-                return
+            if not state["engine_live"].get(side, True): return
 
-            ok, detail = await BreakoutEngine.check_vol_matrix(stock, candle, side, state)
-            if not ok:
+            # ✅ 0.7% Range aur 0.5% Gap Check
+            if not BreakoutEngine._range_gate_ok(side, c_high, c_low, c_close, pdh, pdl):
                 return
 
-            stock["brk_status"] = "TRIGGER_WATCH"
-            stock["brk_side_latch"] = "bull"
-            stock["brk_trigger_px"] = float(high)
-            stock["brk_trigger_set_ts"] = int(now.timestamp())
-            stock["brk_trigger_candle"] = dict(candle)
+            # Volume Confirmation Matrix check
+            v_ok, v_detail = await BreakoutEngine.check_vol_matrix(stock, candle, side, state)
+            if not v_ok:
+                return
 
-            stock["brk_scan_vol"] = int(c_vol)
-            stock["brk_scan_reason"] = f"PDH break + Vol OK ({detail})"
-            return
+            stock.update({
+                "brk_status": "TRIGGER_WATCH",
+                "brk_side_latch": "bull",
+                "brk_trigger_px": float(c_high),
+                "brk_trigger_candle": dict(candle),
+                "brk_set_ts": datetime.now(IST).timestamp(),
+                "brk_scan_reason": f"PDH Break + Vol {v_detail}"
+            })
+            logger.info(f"✅ [BRK-QUALIFY] {symbol} BULLISH | Trigger: {c_high}")
 
-        # BEAR
-        if close < pdl:
+        # 2. BEAR QUALIFICATION (PDL Breakdown)
+        elif c_close < pdl:
             side = "bear"
-            if not bool(state["engine_live"].get(side, True)):
-                return
-            if not BreakoutEngine._within_trade_window(state["config"].get(side, {}), now=now):
-                return
-            if not BreakoutEngine._range_gate_ok(side, high, low, close, pdh=pdh, pdl=pdl):
-                return
+            if not state["engine_live"].get(side, True): return
 
-            ok, detail = await BreakoutEngine.check_vol_matrix(stock, candle, side, state)
-            if not ok:
+            # ✅ 0.7% Range aur 0.5% Gap Check
+            if not BreakoutEngine._range_gate_ok(side, c_high, c_low, c_close, pdh, pdl):
                 return
 
-            stock["brk_status"] = "TRIGGER_WATCH"
-            stock["brk_side_latch"] = "bear"
-            stock["brk_trigger_px"] = float(low)
-            stock["brk_trigger_set_ts"] = int(now.timestamp())
-            stock["brk_trigger_candle"] = dict(candle)
+            v_ok, v_detail = await BreakoutEngine.check_vol_matrix(stock, candle, side, state)
+            if not v_ok:
+                return
 
-            stock["brk_scan_vol"] = int(c_vol)
-            stock["brk_scan_reason"] = f"PDL break + Vol OK ({detail})"
-            return
+            stock.update({
+                "brk_status": "TRIGGER_WATCH",
+                "brk_side_latch": "bear",
+                "brk_trigger_px": float(c_low),
+                "brk_trigger_candle": dict(candle),
+                "brk_set_ts": datetime.now(IST).timestamp(),
+                "brk_scan_reason": f"PDL Break + Vol {v_detail}"
+            })
+            logger.info(f"✅ [BRK-QUALIFY] {symbol} BEARISH | Trigger: {c_low}")
 
-    # -----------------------------
-    # VOLUME MATRIX
-    # -----------------------------
+    # --- VOLUME MATRIX LOGIC ---
     @staticmethod
-    async def check_vol_matrix(stock: dict, candle: dict, side: str, state: dict):
+    async def check_vol_matrix(stock: dict, candle: dict, side: str, state: dict) -> Tuple[bool, str]:
+        """
+        10-tier volume matrix ko scan karta hai.
+        """
         cfg = state["config"].get(side, {})
-        matrix = cfg.get("volume_criteria", []) or []
+        matrix = cfg.get("volume_criteria", [])
+        if not matrix: return True, "NoMatrix"
 
-        c_vol = int(candle.get("volume", 0) or 0)
-        s_sma = float(stock.get("sma", 0) or 0)
-        close = float(candle.get("close", 0) or 0)
-        c_val_cr = (c_vol * close) / 10000000.0 if close > 0 else 0.0
-
-        if not matrix:
-            return True, "NoMatrix"
+        c_vol = int(candle.get("volume", 0))
+        s_sma = float(stock.get("sma", 0))
+        c_val_cr = (c_vol * candle['close']) / 10000000.0 # Value in Crores
 
         tier_found = None
         for i, level in enumerate(matrix):
-            min_sma_avg = float(level.get("min_sma_avg", 0) or 0)
-            if s_sma >= min_sma_avg:
+            if s_sma >= float(level.get("min_sma_avg", 0)):
                 tier_found = (i, level)
             else:
-                break
+                break # Hierarchy break
 
-        if not tier_found:
-            return False, f"SMA {s_sma:,.0f} too low"
+        if not tier_found: 
+            return False, "SMA_Low"
 
         idx, level = tier_found
-        required_vol = s_sma * float(level.get("sma_multiplier", 1.0) or 1.0)
-        min_cr = float(level.get("min_vol_price_cr", 0) or 0)
+        req_vol = s_sma * float(level.get("sma_multiplier", 1.0))
+        min_cr = float(level.get("min_vol_price_cr", 0))
 
-        if c_vol >= required_vol and c_val_cr >= min_cr:
-            return True, f"Tier{idx+1}Pass"
-        return False, f"Tier{idx+1}Fail"
+        if c_vol >= req_vol and c_val_cr >= min_cr:
+            return True, f"Tier{idx+1}_Pass"
+        
+        return False, f"Tier{idx+1}_Fail"
 
-    # -----------------------------
-    # OPEN TRADE
-    # -----------------------------
+    # --- EXECUTION LOGIC ---
     @staticmethod
-    async def open_trade(stock: dict, ltp: float, state: dict, side_key: str):
-        symbol = stock.get("symbol") or ""
-        if not symbol:
-            BreakoutEngine._reset_waiting(stock)
-            return
+    async def open_trade(stock, ltp: float, state: dict, side_key: str):
+        """
+        Redis mein trade reserve karta hai aur Zerodha order place karta hai.
+        """
+        # Final Directional check
+        if side_key == "bull" and ltp <= stock["brk_trigger_px"]: return
+        if side_key == "bear" and ltp >= stock["brk_trigger_px"]: return
 
-        cfg = state["config"].get(side_key, {})
+        symbol = stock["symbol"]
         kite = state.get("kite")
+        cfg = state["config"].get(side_key, {})
+
         if not kite:
-            BreakoutEngine._reset_waiting(stock)
+            logger.error(f"❌ [BRK] Kite session missing for {symbol}")
             return
 
-        if not bool(state["engine_live"].get(side_key, True)):
-            BreakoutEngine._reset_waiting(stock)
-            return
-        if not BreakoutEngine._within_trade_window(cfg):
-            BreakoutEngine._reset_waiting(stock)
-            return
-
-        # 1) side limit reservation (atomic)
-        side_limit = int(cfg.get("total_trades", 5) or 5)
-        if not await TradeControl.reserve_side_trade(side_key, side_limit):
-            BreakoutEngine._reset_waiting(stock)
-            return
-
-        # 2) per-symbol reservation (atomic + open lock)
-        ok, reason = await TradeControl.reserve_symbol_trade(symbol, max_trades=BreakoutEngine.MAX_TRADES_PER_SYMBOL)
+        # Redis Atomic Check (Locking)
+        ok, reason = await TradeControl.reserve_symbol_trade(symbol, BreakoutEngine.MAX_TRADES_PER_SYMBOL)
         if not ok:
-            await TradeControl.rollback_side_trade(side_key)
-            BreakoutEngine._reset_waiting(stock)
+            logger.warning(f"🚫 [BRK] {symbol} block by Redis: {reason}")
+            stock["brk_status"] = "WAITING"
             return
 
         is_bull = (side_key == "bull")
-
         trig_candle = stock.get("brk_trigger_candle") or {}
-        sl_px = float(trig_candle.get("low", 0) or 0) if is_bull else float(trig_candle.get("high", 0) or 0)
+        
+        # Stoploss Calculation
+        sl_px = float(trig_candle.get("low" if is_bull else "high", 0))
+        if sl_px <= 0: 
+            sl_px = ltp * 0.995 if is_bull else ltp * 1.005 # Safety fallback
 
-        entry = float(ltp)
-        if sl_px <= 0:
-            sl_px = round(entry * (0.995 if is_bull else 1.005), 2)
-
-        risk_per_share = max(abs(entry - sl_px), entry * 0.005)
-        risk_amount = float(cfg.get("risk_trade_1", 2000) or 2000)
+        risk_per_share = max(abs(ltp - sl_px), ltp * 0.003)
+        risk_amount = float(cfg.get("risk_trade_1", 2000))
         qty = floor(risk_amount / risk_per_share)
+
         if qty <= 0:
             await TradeControl.rollback_symbol_trade(symbol)
-            await TradeControl.rollback_side_trade(side_key)
-            BreakoutEngine._reset_waiting(stock)
+            stock["brk_status"] = "WAITING"
             return
 
         try:
+            # Transaction Type is strictly mapped to side_key
+            t_type = kite.TRANSACTION_TYPE_BUY if is_bull else kite.TRANSACTION_TYPE_SELL
+            
             order_id = await asyncio.to_thread(
                 kite.place_order,
                 variety=kite.VARIETY_REGULAR,
                 exchange=kite.EXCHANGE_NSE,
                 tradingsymbol=symbol,
-                transaction_type=(kite.TRANSACTION_TYPE_BUY if is_bull else kite.TRANSACTION_TYPE_SELL),
-                quantity=qty,
+                transaction_type=t_type,
+                quantity=int(qty),
                 product=kite.PRODUCT_MIS,
-                order_type=kite.ORDER_TYPE_MARKET,
+                order_type=kite.ORDER_TYPE_MARKET
             )
 
-            rr_val = float(str(cfg.get("risk_reward", "1:2")).split(":")[-1])
-            target = round(entry + (risk_per_share * rr_val), 2) if is_bull else round(entry - (risk_per_share * rr_val), 2)
+            # Target calculation based on settings
+            rr_str = str(cfg.get("risk_reward", "1:2"))
+            rr_val = float(rr_str.split(":")[-1])
+            target_px = ltp + (risk_per_share * rr_val) if is_bull else ltp - (risk_per_share * rr_val)
 
-            tsl_ratio = float(str(cfg.get("trailing_sl", "1:1.5")).split(":")[-1])
-            trail_step = float(risk_per_share * tsl_ratio) if tsl_ratio > 0 else float(risk_per_share)
-
-            trade = {
+            trade_obj = {
                 "engine": "breakout",
-                "side": side_key,
                 "symbol": symbol,
+                "side": side_key,
                 "qty": int(qty),
-                "entry_price": float(entry),
-                "sl_price": float(sl_px),
-                "target_price": float(target),
-                "order_id": order_id,
-                "pnl": 0.0,
+                "entry_price": float(ltp),
+                "sl_price": round(float(sl_px), 2),
+                "target_price": round(float(target_px), 2),
                 "status": "OPEN",
-                "entry_time": datetime.now(IST).strftime("%H:%M:%S"),
-                "init_risk": float(risk_per_share),
-                "trail_step": float(trail_step),
+                "oid": order_id,
+                "pnl": 0.0,
+                "time": datetime.now(IST).strftime("%H:%M:%S")
             }
 
-            state["trades"][side_key].append(trade)
-
             stock["brk_status"] = "OPEN"
-            stock["brk_active_trade"] = trade
-            stock["brk_side_latch"] = side_key
-
-            # clear scanner
-            stock["brk_scan_seen_ts"] = None
-            stock["brk_scan_seen_time"] = None
+            stock["brk_active_trade"] = trade_obj
+            state["trades"][side_key].append(trade_obj)
+            
+            logger.info(f"🔥 [BRK-EXEC] {symbol} {side_key.upper()} OrderPlaced: {order_id}")
 
         except Exception as e:
-            logger.error(f"❌ [BRK ORDER ERROR] {symbol}: {e}")
+            logger.error(f"❌ [BRK-ORDER-ERROR] {symbol}: {e}")
             await TradeControl.rollback_symbol_trade(symbol)
-            await TradeControl.rollback_side_trade(side_key)
-            BreakoutEngine._reset_waiting(stock)
+            stock["brk_status"] = "WAITING"
 
-    # -----------------------------
-    # MONITOR / EXIT
-    # -----------------------------
+    # --- MONITORING & PNL ---
     @staticmethod
-    async def monitor_active_trade(stock: dict, ltp: float, state: dict):
+    async def monitor_active_trade(stock, ltp: float, state: dict):
+        """
+        Live PnL update karta hai aur SL/Target hit check karta hai.
+        """
         trade = stock.get("brk_active_trade")
-        if not trade:
-            return
+        if not trade: return
 
-        side_key = (stock.get("brk_side_latch") or "").lower()
-        is_bull = (side_key == "bull")
+        is_bull = (trade["side"] == "bull")
+        entry = trade["entry_price"]
+        qty = trade["qty"]
+        sl = trade["sl_price"]
+        target = trade["target_price"]
 
-        entry = float(trade.get("entry_price", 0) or 0)
-        qty = int(trade.get("qty", 0) or 0)
-        sl = float(trade.get("sl_price", 0) or 0)
-        target = float(trade.get("target_price", 0) or 0)
+        # Real-time PnL (index.html isse fetch karta hai)
+        trade["pnl"] = round((ltp - entry) * qty if is_bull else (entry - ltp) * qty, 2)
 
-        if entry <= 0 or qty <= 0:
-            await BreakoutEngine.close_position(stock, state, "BAD_TRADE_STATE")
-            return
-
-        trade["pnl"] = round(((float(ltp) - entry) * qty) if is_bull else ((entry - float(ltp)) * qty), 2)
-
-        b = BreakoutEngine.EXIT_BUFFER_PCT
-        if is_bull:
-            target_hit = float(ltp) >= (target * (1.0 - b))
-            sl_hit = float(ltp) <= (sl * (1.0 + b))
-        else:
-            target_hit = float(ltp) <= (target * (1.0 + b))
-            sl_hit = float(ltp) >= (sl * (1.0 - b))
+        # SL / Target Exit Check
+        target_hit = (ltp >= target) if is_bull else (ltp <= target)
+        sl_hit = (ltp <= sl) if is_bull else (ltp >= sl)
 
         if target_hit:
-            await BreakoutEngine.close_position(stock, state, "TARGET")
-            return
-
-        if sl_hit:
-            await BreakoutEngine.close_position(stock, state, "SL")
-            return
-
-        # trail
-        new_sl = BreakoutEngine._step_trail_sl(trade, float(ltp), is_bull)
-        if new_sl is not None:
-            cur = float(trade.get("sl_price", 0) or 0)
-            if is_bull and new_sl > cur:
-                trade["sl_price"] = float(new_sl)
-            elif (not is_bull) and new_sl < cur:
-                trade["sl_price"] = float(new_sl)
-
-        if stock.get("symbol") in state.get("manual_exits", set()):
-            await BreakoutEngine.close_position(stock, state, "MANUAL")
-            state["manual_exits"].remove(stock["symbol"])
-
-    @staticmethod
-    def _step_trail_sl(trade: dict, ltp: float, is_bull: bool):
-        entry = float(trade.get("entry_price", 0) or 0)
-        init_risk = float(trade.get("init_risk", 0) or 0)
-        step = float(trade.get("trail_step", 0) or 0)
-        if entry <= 0 or init_risk <= 0 or step <= 0:
-            return None
-
-        profit = (ltp - entry) if is_bull else (entry - ltp)
-        if profit <= 0:
-            return None
-
-        k = int(profit // step)
-        if k < 1:
-            return None
-
-        desired = entry + ((k - 1) * step) if is_bull else entry - ((k - 1) * step)
-        return round(desired, 2)
+            await BreakoutEngine.close_position(stock, state, "TARGET_HIT")
+        elif sl_hit:
+            await BreakoutEngine.close_position(stock, state, "SL_HIT")
 
     @staticmethod
     async def close_position(stock: dict, state: dict, reason: str):
+        """
+        Position exit order place karta hai aur Redis lock release karta hai.
+        """
         trade = stock.get("brk_active_trade")
+        if not trade or trade["status"] != "OPEN": return
+        
         kite = state.get("kite")
-        symbol = stock.get("symbol") or ""
-        side_key = (stock.get("brk_side_latch") or "").lower()
-        is_bull = (side_key == "bull")
+        symbol = stock["symbol"]
+        is_bull = (trade["side"] == "bull")
 
-        if trade and kite and symbol:
-            try:
-                exit_id = await asyncio.to_thread(
-                    kite.place_order,
-                    variety=kite.VARIETY_REGULAR,
-                    exchange=kite.EXCHANGE_NSE,
-                    tradingsymbol=symbol,
-                    transaction_type=(kite.TRANSACTION_TYPE_SELL if is_bull else kite.TRANSACTION_TYPE_BUY),
-                    quantity=int(trade["qty"]),
-                    product=kite.PRODUCT_MIS,
-                    order_type=kite.ORDER_TYPE_MARKET,
-                )
-                trade["exit_order_id"] = exit_id
-            except Exception as e:
-                logger.error(f"❌ [BRK EXIT ERROR] {symbol}: {e}")
-
-        if trade:
+        try:
+            # Exit direction is opposite of Entry
+            t_type = kite.TRANSACTION_TYPE_SELL if is_bull else kite.TRANSACTION_TYPE_BUY
+            
+            exit_id = await asyncio.to_thread(
+                kite.place_order,
+                variety=kite.VARIETY_REGULAR,
+                exchange=kite.EXCHANGE_NSE,
+                tradingsymbol=symbol,
+                transaction_type=t_type,
+                quantity=int(trade["qty"]),
+                product=kite.PRODUCT_MIS,
+                order_type=kite.ORDER_TYPE_MARKET
+            )
+            
             trade["status"] = "CLOSED"
-            trade["exit_time"] = datetime.now(IST).strftime("%H:%M:%S")
+            trade["exit_oid"] = exit_id
             trade["exit_reason"] = reason
-
-        # release per-symbol open lock so 2nd trade can occur
-        if symbol:
+            stock["brk_status"] = "CLOSED"
+            
+            # Release Redis Lock so next trade can happen in future
             await TradeControl.release_symbol_lock(symbol)
+            logger.info(f"⏹️ [BRK-EXIT] {symbol} Reason: {reason}")
 
-        BreakoutEngine._reset_waiting(stock)
+        except Exception as e:
+            logger.error(f"❌ [BRK-EXIT-ERROR] {symbol}: {e}")
 
-    # -----------------------------
-    # HELPERS
-    # -----------------------------
+    # --- HELPERS (FILTERS) ---
     @staticmethod
     def _reset_waiting(stock: dict):
+        """Engine state ko reset karta hai."""
         stock["brk_status"] = "WAITING"
         stock["brk_active_trade"] = None
-
         stock.pop("brk_trigger_px", None)
         stock.pop("brk_side_latch", None)
-        stock["brk_trigger_set_ts"] = None
-        stock.pop("brk_trigger_candle", None)
-
-        stock["brk_scan_seen_ts"] = None
-        stock["brk_scan_seen_time"] = None
-        stock["brk_scan_vol"] = 0
-        stock["brk_scan_reason"] = None
+        stock.pop("brk_set_ts", None)
 
     @staticmethod
-    def _within_trade_window(cfg: dict, now: Optional[datetime] = None) -> bool:
-        from datetime import time as dtime
+    def _within_trade_window(cfg: dict) -> bool:
+        """Dashboard timings ke andar hai ya nahi?"""
         try:
-            now = now or datetime.now(IST)
-            start_s = str(cfg.get("trade_start", "09:15"))
-            end_s = str(cfg.get("trade_end", "15:10"))
-            sh, sm = map(int, start_s.split(":"))
-            eh, em = map(int, end_s.split(":"))
-            start_t = dtime(sh, sm)
-            end_t = dtime(eh, em)
-            nt = now.time()
-            return (nt >= start_t) and (nt <= end_t)
-        except Exception:
-            return True
+            now = datetime.now(IST).time()
+            start = datetime.strptime(cfg.get("trade_start", "09:15"), "%H:%M").time()
+            end = datetime.strptime(cfg.get("trade_end", "15:10"), "%H:%M").time()
+            return start <= now <= end
+        except: return True
 
     @staticmethod
-    def _range_gate_ok(side: str, high: float, low: float, close: float, *, pdh: float, pdl: float) -> bool:
-        if close <= 0:
-            return False
+    def _range_gate_ok(side, high, low, close, pdh, pdl) -> bool:
+        """
+        ✅ 0.7% Candle Range Filter: Volatility control
+        ✅ 0.5% Gap Filter: Over-extension control
+        """
+        # 1. Range Check: Candle ki body aur wicks bohot badi nahi honi chahiye
         range_pct = ((high - low) / close) * 100.0
-        if range_pct <= 0.7:
-            return True
-
+        if range_pct > 0.7:
+            logger.warning(f"🚫 Range rejected: {range_pct:.2f}% (Limit: 0.7%)")
+            return False
+        
+        # 2. Gap Check: Breakout point PDH/PDL se bohot door nahi hona chahiye
         if side == "bull":
-            if pdh <= 0:
+            gap = ((high - pdh) / pdh) * 100.0
+            if gap > 0.5:
+                logger.warning(f"🚫 Bull Gap rejected: {gap:.2f}% (Limit: 0.5%)")
                 return False
-            gap_pct = ((high - pdh) / pdh) * 100.0
-            return gap_pct <= 0.5
-
-        if side == "bear":
-            if pdl <= 0:
+        else:
+            gap = ((pdl - low) / pdl) * 100.0
+            if gap > 0.5:
+                logger.warning(f"🚫 Bear Gap rejected: {gap:.2f}% (Limit: 0.5%)")
                 return False
-            gap_pct = ((pdl - low) / pdl) * 100.0
-            return gap_pct <= 0.5
 
-        return False
+        return True
