@@ -379,8 +379,63 @@ async def home():
     except Exception:
         return HTMLResponse("<h3>Nexus backend is running. Place index.html next to main.py</h3>")
 
-@app.get("/login/")
-async def login(request_token: Optional[str] = None):
+# @app.get("/login/")
+# async def login(request_token: Optional[str] = None):
+#     api_key = RAM_STATE["api_key"] or os.getenv("KITE_API_KEY", "")
+#     api_secret = RAM_STATE["api_secret"] or os.getenv("KITE_API_SECRET", "")
+
+#     if not api_key:
+#         k, s = await TradeControl.get_config()
+#         api_key = api_key or (k or "")
+#         api_secret = api_secret or (s or "")
+
+#     if not api_key:
+#         return HTMLResponse("<h3>Save API KEY first (API Gateway button)</h3>")
+
+#     if not request_token:
+#         try:
+#             url = KiteConnect(api_key=str(api_key)).login_url()
+#             return RedirectResponse(url=url)
+#         except Exception as e:
+#             return HTMLResponse(f"<h3>Login URL error: {e}</h3>")
+
+#     try:
+#         kite = KiteConnect(api_key=str(api_key))
+#         data = await asyncio.to_thread(kite.generate_session, request_token, api_secret=str(api_secret))
+#         access_token = data["access_token"]
+
+#         await TradeControl.save_access_token(access_token)
+
+#         RAM_STATE["access_token"] = str(access_token)
+#         RAM_STATE["api_key"] = str(api_key)
+#         RAM_STATE["api_secret"] = str(api_secret)
+
+#         RAM_STATE["kite"] = kite
+#         RAM_STATE["kite"].set_access_token(access_token)
+
+#         # ✅ Restart WS immediately after login
+#         _start_kiteticker()
+
+#         logger.info("✅ AUTH: Session established & saved to Redis.")
+#         return RedirectResponse(url="/")
+#     except Exception as e:
+#         logger.exception(f"❌ AUTH ERROR: {e}")
+#         return HTMLResponse(f"<h3>Auth failed: {e}</h3>")
+
+@app.get("/login", include_in_schema=False)
+@app.get("/login/", include_in_schema=False)
+async def login(request: Request, request_token: Optional[str] = None, status: Optional[str] = None):
+    """
+    Handles both:
+      /login
+      /login/
+    and accepts Zerodha callback params safely.
+    """
+
+    # If Zerodha returned non-success
+    if status and str(status).lower() != "success":
+        return HTMLResponse(f"<h3>Login not successful. status={status}</h3>")
+
     api_key = RAM_STATE["api_key"] or os.getenv("KITE_API_KEY", "")
     api_secret = RAM_STATE["api_secret"] or os.getenv("KITE_API_SECRET", "")
 
@@ -392,6 +447,7 @@ async def login(request_token: Optional[str] = None):
     if not api_key:
         return HTMLResponse("<h3>Save API KEY first (API Gateway button)</h3>")
 
+    # Step-1: Redirect to Kite login if no request_token
     if not request_token:
         try:
             url = KiteConnect(api_key=str(api_key)).login_url()
@@ -399,6 +455,7 @@ async def login(request_token: Optional[str] = None):
         except Exception as e:
             return HTMLResponse(f"<h3>Login URL error: {e}</h3>")
 
+    # Step-2: Exchange request_token -> access_token
     try:
         kite = KiteConnect(api_key=str(api_key))
         data = await asyncio.to_thread(kite.generate_session, request_token, api_secret=str(api_secret))
@@ -413,15 +470,32 @@ async def login(request_token: Optional[str] = None):
         RAM_STATE["kite"] = kite
         RAM_STATE["kite"].set_access_token(access_token)
 
-        # ✅ Restart WS immediately after login
-        _start_kiteticker()
+        # ✅ IMPORTANT: restart websocket immediately after login
+        try:
+            old = RAM_STATE.get("kws")
+            if old:
+                old.close()
+        except Exception:
+            pass
+
+        try:
+            RAM_STATE["kws"] = KiteTicker(RAM_STATE["api_key"], RAM_STATE["access_token"])
+            RAM_STATE["kws"].on_ticks = on_ticks
+            RAM_STATE["kws"].on_connect = on_connect
+            RAM_STATE["kws"].on_error = on_error
+            RAM_STATE["kws"].on_close = on_close
+            RAM_STATE["kws"].connect(threaded=True)
+            logger.info("🛰️ WS: Restarted KiteTicker after login.")
+        except Exception as e:
+            logger.exception(f"❌ WS restart failed after login: {e}")
 
         logger.info("✅ AUTH: Session established & saved to Redis.")
         return RedirectResponse(url="/")
+
     except Exception as e:
         logger.exception(f"❌ AUTH ERROR: {e}")
         return HTMLResponse(f"<h3>Auth failed: {e}</h3>")
-
+    
 @app.get("/api/stats")
 async def get_stats():
     pnl = _compute_pnl()
