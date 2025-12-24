@@ -1,476 +1,693 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nexus | Ultra-Low Latency Dashboard</title>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Nexus | Ultra-Low Latency Dashboard</title>
 
-    <!-- External Dependencies -->
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script src="https://unpkg.com/lucide@latest"></script>
-    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+  <!-- External Dependencies -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
+  <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
 
-    <style>
-        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
 
-        body {
-            background-color: #030712;
-            color: #f3f4f6;
-            font-family: 'JetBrains Mono', monospace;
-            margin: 0;
-            overflow: hidden;
-            height: 100vh;
-        }
+    body {
+      background-color: #030712;
+      color: #f3f4f6;
+      font-family: 'JetBrains Mono', monospace;
+      margin: 0;
+      overflow: hidden;
+      height: 100vh;
+    }
 
-        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: #0f172a; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
+    .custom-scrollbar::-webkit-scrollbar { width: 4px; }
+    .custom-scrollbar::-webkit-scrollbar-track { background: #0f172a; }
+    .custom-scrollbar::-webkit-scrollbar-thumb { background: #334155; border-radius: 10px; }
 
-        .glass-panel {
-            background: rgba(15, 23, 42, 0.8);
-            backdrop-filter: blur(16px);
-            border: 1px solid rgba(51, 65, 85, 0.4);
-        }
+    .glass-panel {
+      background: rgba(15, 23, 42, 0.8);
+      backdrop-filter: blur(16px);
+      border: 1px solid rgba(51, 65, 85, 0.4);
+    }
 
-        .matrix-input {
-            background-color: #020617;
-            border: 1px solid #1e293b;
-            border-radius: 4px;
-            height: 1.8rem;
-            text-align: center;
-            font-size: 0.75rem;
-            font-weight: 700;
-            width: 100%;
-            color: #fff;
-            outline: none;
-            transition: border-color 0.2s;
-        }
-        .matrix-input:focus { border-color: #3b82f6; }
+    .matrix-input {
+      background-color: #020617;
+      border: 1px solid #1e293b;
+      border-radius: 4px;
+      height: 1.8rem;
+      text-align: center;
+      font-size: 0.75rem;
+      font-weight: 700;
+      width: 100%;
+      color: #fff;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .matrix-input:focus { border-color: #3b82f6; }
 
-        .log-line {
-            font-size: 10px;
-            padding: 2px 8px;
-            border-left: 2px solid #1e293b;
-            margin-bottom: 2px;
-            color: #94a3b8;
-        }
+    .log-line {
+      font-size: 10px;
+      padding: 2px 8px;
+      border-left: 2px solid #1e293b;
+      margin-bottom: 2px;
+      color: #94a3b8;
+    }
 
-        .switch { position: relative; display: inline-block; width: 34px; height: 18px; }
-        .switch input { opacity: 0; width: 0; height: 0; }
-        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #1e293b; transition: .4s; border-radius: 34px; }
-        .slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 2px; bottom: 2px; background-color: white; transition: .4s; border-radius: 50%; }
-        input:checked + .slider { background-color: #2563eb; }
-        input:checked + .slider:before { transform: translateX(16px); }
+    .switch { position: relative; display: inline-block; width: 34px; height: 18px; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #1e293b; transition: .4s; border-radius: 34px; }
+    .slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 2px; bottom: 2px; background-color: white; transition: .4s; border-radius: 50%; }
+    input:checked + .slider { background-color: #2563eb; }
+    input:checked + .slider:before { transform: translateX(16px); }
 
-        .scanner-card {
-            border-left: 4px solid #3b82f6;
-            background: linear-gradient(90deg, rgba(59, 130, 246, 0.05) 0%, rgba(0,0,0,0) 100%);
-        }
+    .scanner-card {
+      border-left: 4px solid #3b82f6;
+      background: linear-gradient(90deg, rgba(59, 130, 246, 0.05) 0%, rgba(0,0,0,0) 100%);
+    }
 
-        .icon-btn {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            padding: 4px;
-            border-radius: 8px;
-            border: 1px solid rgba(51, 65, 85, 0.6);
-            background: rgba(15, 23, 42, 0.6);
-            transition: all 0.15s ease;
-        }
-        .icon-btn:hover {
-            transform: translateY(-1px);
-            background: rgba(30, 41, 59, 0.8);
-            border-color: rgba(59, 130, 246, 0.7);
-        }
-        .icon-danger:hover { border-color: rgba(244, 63, 94, 0.7); }
-        .tiny { font-size: 9px; letter-spacing: 0.12em; }
-        .muted { color: #64748b; }
-        .mono { font-family: 'JetBrains Mono', monospace; }
-    </style>
+    .icon-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4px;
+      border-radius: 8px;
+      border: 1px solid rgba(51, 65, 85, 0.6);
+      background: rgba(15, 23, 42, 0.6);
+      transition: all 0.15s ease;
+    }
+    .icon-btn:hover {
+      transform: translateY(-1px);
+      background: rgba(30, 41, 59, 0.8);
+      border-color: rgba(59, 130, 246, 0.7);
+    }
+    .icon-danger:hover {
+      border-color: rgba(244, 63, 94, 0.7);
+    }
+    .tiny {
+      font-size: 9px;
+      letter-spacing: 0.12em;
+    }
+    .muted { color: #64748b; }
+    .mono { font-family: 'JetBrains Mono', monospace; }
+
+    /* Sync health */
+    .badge {
+      font-size: 10px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+    .badge-ok { background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.35); }
+    .badge-warn { background: rgba(245,158,11,0.15); color: #fbbf24; border: 1px solid rgba(245,158,11,0.35); }
+    .badge-bad { background: rgba(244,63,94,0.15); color: #fb7185; border: 1px solid rgba(244,63,94,0.35); }
+  </style>
 </head>
+
 <body class="flex h-screen w-full overflow-hidden">
+  <!-- VERTICAL UNIFIED SCANNER (LEFT SIDE) -->
+  <aside class="w-80 border-r border-slate-800 bg-slate-950/50 flex flex-col h-full shrink-0 shadow-2xl">
+    <div class="p-4 border-b border-slate-800 bg-slate-900/40">
+      <div class="flex justify-between items-center mb-1">
+        <h2 class="text-xs font-black text-blue-400 uppercase tracking-widest flex items-center gap-2">
+          <i data-lucide="crosshair" class="w-4 h-4"></i> Live Scanner
+        </h2>
+        <span id="scan-count" class="text-[9px] bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded-full font-bold">0 STOCKS</span>
+      </div>
+      <p class="text-[9px] text-slate-500 font-bold uppercase tracking-tighter italic">Early Warning Signals (Pre-Trigger)</p>
 
-    <!-- VERTICAL UNIFIED SCANNER (LEFT SIDE) -->
-    <aside class="w-80 border-r border-slate-800 bg-slate-950/50 flex flex-col h-full shrink-0 shadow-2xl">
-        <div class="p-4 border-b border-slate-800 bg-slate-900/40">
-            <div class="flex justify-between items-center mb-1">
-                <h2 class="text-xs font-black text-blue-400 uppercase tracking-widest flex items-center gap-2">
-                    <i data-lucide="crosshair" class="w-4 h-4"></i> Live Scanner
-                </h2>
-                <span id="scan-count" class="text-[9px] bg-blue-500/20 text-blue-400 px-2 py-0.5 rounded-full font-bold">0 STOCKS</span>
-            </div>
-            <p class="text-[9px] text-slate-500 font-bold uppercase tracking-tighter italic">Early Warning Signals (Pre-Trigger)</p>
-        </div>
-
-        <div id="unified-scanner" class="flex-1 overflow-y-auto p-3 space-y-2 custom-scrollbar bg-black/20">
-            <div class="text-center py-20 text-slate-700 italic text-[10px]">Awaiting Market Ticks...</div>
-        </div>
-
-        <div class="p-4 border-t border-slate-800 bg-slate-900/20">
-            <div class="flex justify-between items-center">
-                <span class="text-[9px] font-bold text-slate-600 uppercase tracking-widest">Feed Status</span>
-                <span id="feed-status" class="text-[10px] font-mono text-emerald-500 font-bold uppercase tracking-tighter">Connected</span>
-            </div>
-        </div>
-    </aside>
-
-    <!-- MAIN INTERFACE -->
-    <div class="flex-1 flex flex-col min-w-0 h-full overflow-hidden">
-
-        <!-- HEADER -->
-        <header class="h-16 border-b border-slate-800 bg-slate-900/90 px-6 flex justify-between items-center z-30 shrink-0">
-            <div class="flex items-center gap-4">
-                <div class="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center shadow-lg shadow-blue-900/20">
-                    <i data-lucide="zap" class="w-6 h-6 text-white fill-current"></i>
-                </div>
-                <div>
-                    <h1 class="text-xl font-black text-white tracking-tighter uppercase italic leading-none">Nexus<span class="text-blue-500">Core</span></h1>
-                    <div class="flex gap-2 items-center mt-1">
-                        <div id="dot-feed" class="w-2 h-2 rounded-full bg-red-600" title="Websocket Feed Status"></div>
-                        <span class="text-[9px] font-bold text-slate-500 uppercase tracking-widest">Async Logic Integrated</span>
-                    </div>
-                </div>
-            </div>
-
-            <div class="flex items-center gap-8">
-                <div class="text-right">
-                    <div class="text-[9px] text-slate-500 font-bold uppercase tracking-widest">Net Realized P&amp;L</div>
-                    <span id="total-pnl" class="text-xl font-black text-white tabular-nums">₹ 0.00</span>
-                </div>
-                <div class="flex items-center gap-2">
-                    <button onclick="openApiModal()" class="bg-slate-800 hover:bg-slate-700 text-white px-4 py-2 rounded-lg font-bold text-[10px] border border-slate-700 transition-all uppercase tracking-wider">API Gateway</button>
-                    <button onclick="window.location.reload()" class="bg-blue-600 hover:bg-blue-500 text-white p-2 rounded-lg shadow-lg transition-all"><i data-lucide="refresh-cw" class="w-4 h-4"></i></button>
-                </div>
-            </div>
-        </header>
-
-        <!-- DASHBOARD GRID -->
-        <main class="flex-1 overflow-y-auto p-4 custom-scrollbar space-y-4">
-            
-            <!-- Global Stats Bar -->
-            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-                <div class="glass-panel p-3 rounded-xl border border-slate-800">
-                    <p class="text-[9px] text-slate-500 font-bold uppercase">Universe Size</p>
-                    <p id="stat-stocks" class="text-lg font-bold text-blue-400">0</p>
-                </div>
-                <div class="glass-panel p-3 rounded-xl border border-slate-800">
-                    <p class="text-[9px] text-slate-500 font-bold uppercase">Queue Load</p>
-                    <p id="stat-queue" class="text-lg font-bold text-orange-400">0</p>
-                </div>
-                <div class="glass-panel p-3 rounded-xl border border-slate-800">
-                    <p class="text-[9px] text-slate-500 font-bold uppercase">Server Time (IST)</p>
-                    <p id="stat-time" class="text-lg font-bold text-white">00:00:00</p>
-                </div>
-                <div class="glass-panel p-3 rounded-xl border border-slate-800">
-                    <p class="text-[9px] text-slate-500 font-bold uppercase">Latency</p>
-                    <p class="text-lg font-bold text-emerald-400">0.02ms</p>
-                </div>
-            </div>
-
-            <!-- Engine Specific Panels -->
-            <div id="engine-grid" class="grid grid-cols-1 xl:grid-cols-2 gap-4">
-                <!-- JS Inject for Bull, Bear, Mom_Bull, Mom_Bear -->
-            </div>
-
-            <!-- EXECUTION LOGS TERMINAL -->
-            <section class="glass-panel rounded-xl overflow-hidden border border-slate-800 shadow-2xl">
-                <div class="bg-slate-900/80 px-4 py-2 border-b border-slate-800 flex justify-between items-center">
-                    <span class="text-[10px] font-black uppercase text-blue-400 flex items-center gap-2">
-                        <i data-lucide="terminal" class="w-3 h-3"></i> Internal Execution Trace
-                    </span>
-                    <button onclick="document.getElementById('log-container').innerHTML=''" class="text-[8px] text-slate-500 hover:text-white font-bold uppercase tracking-widest">Clear Trace</button>
-                </div>
-                <div id="log-container" class="h-36 overflow-y-auto p-3 bg-black/60 custom-scrollbar font-mono text-slate-400">
-                    <div class="log-line text-blue-500">[SYSTEM] Nexus Async engine listening...</div>
-                </div>
-            </section>
-        </main>
+      <!-- Parallel Sync Status -->
+      <div class="mt-3 flex items-center justify-between">
+        <span class="text-[9px] font-bold text-slate-600 uppercase tracking-widest">UI Sync</span>
+        <span id="ui-sync-badge" class="badge badge-ok">Parallel ON</span>
+      </div>
+      <div class="mt-1 flex items-center justify-between">
+        <span class="text-[9px] font-bold text-slate-600 uppercase tracking-widest">Last Refresh</span>
+        <span id="ui-last-refresh" class="text-[9px] font-bold text-slate-400 mono">--:--:--</span>
+      </div>
     </div>
 
-    <!-- MODAL: STRATEGY CONFIG -->
-    <div id="settings-modal" class="fixed inset-0 bg-black/95 backdrop-blur-md flex items-center justify-center z-50 hidden p-4">
-        <div class="bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl w-full max-w-4xl p-6 max-h-[90vh] flex flex-col">
-            <div class="flex justify-between items-center mb-6 border-b border-slate-800 pb-4">
-                <h3 id="modal-title" class="text-sm font-bold uppercase tracking-widest text-blue-400">Logic Configuration</h3>
-                <button onclick="closeSettings()" class="text-slate-500 hover:text-white"><i data-lucide="x" class="w-6 h-6"></i></button>
+    <div id="unified-scanner" class="flex-1 overflow-y-auto p-3 space-y-2 custom-scrollbar bg-black/20">
+      <div class="text-center py-20 text-slate-700 italic text-[10px]">Awaiting Market Ticks...</div>
+    </div>
+
+    <div class="p-4 border-t border-slate-800 bg-slate-900/20">
+      <div class="flex justify-between items-center">
+        <span class="text-[9px] font-bold text-slate-600 uppercase tracking-widest">Feed Status</span>
+        <span id="feed-status" class="text-[10px] font-mono text-emerald-500 font-bold uppercase">Connected</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN INTERFACE -->
+  <div class="flex-1 flex flex-col min-w-0 h-full overflow-hidden">
+    <!-- HEADER -->
+    <header class="h-16 border-b border-slate-800 bg-slate-900/90 px-6 flex justify-between items-center z-30 shrink-0">
+      <div class="flex items-center gap-4">
+        <div class="w-10 h-10 bg-blue-600 rounded-xl flex items-center justify-center shadow-lg shadow-blue-900/20">
+          <i data-lucide="zap" class="w-6 h-6 text-white fill-current"></i>
+        </div>
+        <div>
+          <h1 class="text-xl font-black text-white tracking-tighter uppercase italic">Nexus<span class="text-blue-500">Core</span></h1>
+          <div class="flex gap-2 items-center">
+            <div id="dot-brk" class="w-2 h-2 rounded-full bg-red-600" title="Breakout Engine"></div>
+            <div id="dot-mom" class="w-2 h-2 rounded-full bg-red-600" title="Momentum Engine"></div>
+            <span class="text-[9px] font-bold text-slate-500 uppercase tracking-widest">Parallel Tick Dispatch</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="flex items-center gap-8">
+        <div class="text-right">
+          <div class="text-[9px] text-slate-500 font-bold uppercase tracking-widest">Net P&L (Realized + Unrealized)</div>
+          <span id="total-pnl" class="text-xl font-black text-white tabular-nums">₹ 0.00</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <button onclick="openApiModal()" class="bg-slate-800 hover:bg-slate-700 text-white px-4 py-2 rounded-lg font-bold text-[10px] border border-slate-700 transition-all uppercase">API Gateway</button>
+          <button onclick="window.location.reload()" class="bg-blue-600 hover:bg-blue-500 text-white p-2 rounded-lg shadow-lg transition-all">
+            <i data-lucide="refresh-cw" class="w-4 h-4"></i>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <!-- ACTIVE POSITIONS GRID -->
+    <main class="flex-1 overflow-y-auto p-4 custom-scrollbar space-y-4">
+      <div id="engine-grid" class="grid grid-cols-1 xl:grid-cols-2 gap-4"></div>
+
+      <!-- SYSTEM LOGS TERMINAL -->
+      <section class="glass-panel rounded-xl overflow-hidden border border-slate-800 shadow-2xl">
+        <div class="bg-slate-900/80 px-4 py-2 border-b border-slate-800 flex justify-between items-center">
+          <span class="text-[10px] font-black uppercase text-blue-400 flex items-center gap-2">
+            <i data-lucide="terminal" class="w-3 h-3"></i> Internal Execution Logs
+          </span>
+          <div class="flex items-center gap-3">
+            <span id="sync-health" class="badge badge-ok">SYNC OK</span>
+            <button onclick="document.getElementById('log-container').innerHTML=''" class="text-[8px] text-slate-500 hover:text-white font-bold uppercase tracking-widest">Flush Logs</button>
+          </div>
+        </div>
+        <div id="log-container" class="h-36 overflow-y-auto p-3 bg-black/60 custom-scrollbar font-mono text-slate-400">
+          <div class="log-line text-blue-500">[SYSTEM] Dashboard running (parallel HTTP sync enabled)...</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- STRATEGY CONFIGURATION MODAL -->
+  <div id="settings-modal" class="fixed inset-0 bg-black/95 backdrop-blur-md flex items-center justify-center z-50 hidden p-4">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl w-full max-w-4xl p-6 max-h-[90vh] flex flex-col">
+      <div class="flex justify-between items-center mb-6 border-b border-slate-800 pb-4">
+        <h3 id="modal-title" class="text-sm font-bold flex items-center gap-2 uppercase tracking-widest text-blue-400">LOGIC CONFIGURATION</h3>
+        <button onclick="closeSettings()" class="text-slate-500 hover:text-white"><i data-lucide="x" class="w-6 h-6"></i></button>
+      </div>
+
+      <div class="flex-1 overflow-y-auto pr-2 custom-scrollbar space-y-8">
+        <div class="space-y-4">
+          <h4 class="text-[10px] font-bold text-slate-500 uppercase tracking-[0.2em] border-l-2 border-blue-500 pl-2">Trading Parameters</h4>
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-4 bg-black/40 p-4 rounded-xl border border-slate-800">
+            <div><label class="text-[9px] font-bold text-slate-400 block mb-1">Target (R:R)</label><input id="inp-rr" class="matrix-input" placeholder="1:2"></div>
+            <div><label class="text-[9px] font-bold text-slate-400 block mb-1">Trailing (TSL)</label><input id="inp-tsl" class="matrix-input" placeholder="1:1.5"></div>
+            <div><label class="text-[9px] font-bold text-slate-400 block mb-1">Max Trades (Side)</label><input id="inp-max-trades" type="number" class="matrix-input"></div>
+            <div><label class="text-[9px] font-bold text-slate-400 block mb-1">Risk/Trade (₹)</label><input id="inp-risk" type="number" class="matrix-input"></div>
+          </div>
+
+          <!-- Breakout-only trading window -->
+          <div id="breakout-time-box" class="hidden">
+            <h4 class="text-[10px] font-bold text-slate-500 uppercase tracking-[0.2em] border-l-2 border-emerald-500 pl-2 mt-2">Trading Window</h4>
+            <div class="grid grid-cols-2 gap-4 bg-black/40 p-4 rounded-xl border border-slate-800">
+              <div>
+                <label class="text-[9px] font-bold text-slate-400 block mb-1">Entry Start (HH:MM)</label>
+                <input id="inp-start" type="time" class="matrix-input">
+              </div>
+              <div>
+                <label class="text-[9px] font-bold text-slate-400 block mb-1">Entry End (HH:MM)</label>
+                <input id="inp-end" type="time" class="matrix-input">
+              </div>
             </div>
-
-            <div class="flex-1 overflow-y-auto pr-2 custom-scrollbar space-y-8">
-                <div class="space-y-4">
-                    <h4 class="text-[10px] font-bold text-slate-500 uppercase tracking-[0.2em] border-l-2 border-blue-500 pl-2">Risk Parameters</h4>
-                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 bg-black/40 p-4 rounded-xl border border-slate-800">
-                        <div><label class="text-[9px] font-bold text-slate-400 block mb-1 uppercase">Target (R:R)</label><input id="inp-rr" class="matrix-input" placeholder="1:2"></div>
-                        <div><label class="text-[9px] font-bold text-slate-400 block mb-1 uppercase">Trailing (TSL)</label><input id="inp-tsl" class="matrix-input" placeholder="1:1.5"></div>
-                        <div><label class="text-[9px] font-bold text-slate-400 block mb-1 uppercase">Max Trades</label><input id="inp-max-trades" type="number" class="matrix-input"></div>
-                        <div><label class="text-[9px] font-bold text-slate-400 block mb-1 uppercase">Risk /Trade</label><input id="inp-risk" type="number" class="matrix-input"></div>
-                    </div>
-                </div>
-
-                <!-- Volume SMA Matrix -->
-                <div class="space-y-4">
-                    <div class="flex items-center justify-between border-l-2 border-emerald-500 pl-2">
-                        <h4 class="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em]">10-Tier Vol-SMA Matrix</h4>
-                        <button onclick="applyMatrixDefaults()" class="text-[8px] bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded font-bold border border-slate-700 uppercase">Apply Defaults</button>
-                    </div>
-
-                    <div class="bg-black/40 p-4 rounded-xl border border-slate-800">
-                        <div class="grid grid-cols-4 gap-4 mb-3 text-[9px] font-black text-slate-600 uppercase text-center border-b border-slate-800 pb-2">
-                            <div>Tier</div>
-                            <div>Min Cr. Value</div>
-                            <div>SMA Mult.</div>
-                            <div>Min SMA Avg</div>
-                        </div>
-                        <div id="volume-levels-container" class="space-y-2"></div>
-                    </div>
-                </div>
+            <div class="text-[9px] text-slate-500 italic mt-2">
+              After end time: no new trades, but existing open trades keep monitoring.
             </div>
+          </div>
+        </div>
 
-            <div class="pt-6 border-t border-slate-800 mt-4">
-                <button onclick="saveSettings()" class="w-full bg-blue-600 py-3 rounded-xl font-black text-xs uppercase tracking-widest hover:bg-blue-500 transition-all flex items-center justify-center gap-2">
-                    <i data-lucide="save" class="w-4 h-4"></i> Save Logic to Redis
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-l-2 border-emerald-500 pl-2">
+            <h4 class="text-[10px] font-bold text-slate-400 uppercase tracking-[0.2em]">Volume SMA Multiplier Matrix</h4>
+            <button onclick="applyMatrixDefaults()" class="text-[8px] bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded font-bold border border-slate-700 uppercase">
+              Defaults
+            </button>
+          </div>
+
+          <div class="bg-black/40 p-4 rounded-xl border border-slate-800">
+            <div class="grid grid-cols-4 gap-4 mb-3 text-[9px] font-black text-slate-600 uppercase text-center border-b border-slate-800 pb-2">
+              <div>Tier</div>
+              <div>Min Cr. Value</div>
+              <div>SMA Multiplier</div>
+              <div>Min SMA Avg Vol</div>
+            </div>
+            <div id="volume-levels-container" class="space-y-2"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="pt-6 border-t border-slate-800 mt-4">
+        <button onclick="saveSettings()" class="w-full bg-blue-600 py-3 rounded-xl font-black text-xs uppercase tracking-widest shadow-xl hover:bg-blue-500 transition-all flex items-center justify-center gap-2">
+          <i data-lucide="save" class="w-4 h-4"></i> Save to Redis + Broadcast to Engine
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- API CONFIG MODAL -->
+  <div id="api-modal" class="fixed inset-0 bg-black/95 flex items-center justify-center z-50 hidden p-4 backdrop-blur-xl">
+    <div class="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-sm p-10 shadow-2xl text-center">
+      <h3 class="text-lg font-bold text-white mb-2 uppercase">Auth Gateway</h3>
+      <p class="text-[10px] text-slate-500 mb-8 uppercase tracking-widest">KiteConnect HFT Integration</p>
+
+      <div class="space-y-4 mb-8">
+        <input id="api-key-input" placeholder="API KEY" class="matrix-input !h-11 px-4 !bg-black">
+        <input id="api-secret-input" type="password" placeholder="API SECRET" class="matrix-input !h-11 px-4 !bg-black">
+      </div>
+
+      <button onclick="saveApi()" class="w-full bg-blue-600 py-3 rounded-xl font-black text-xs uppercase mb-3 transition-all">Save Credentials</button>
+      <button onclick="window.location.href='/login/'" class="w-full bg-emerald-600/10 border border-emerald-600/30 text-emerald-500 py-2.5 rounded-xl text-[10px] font-bold uppercase hover:bg-emerald-600/20">Authenticate Zerodha</button>
+
+      <button onclick="document.getElementById('api-modal').classList.add('hidden')" class="mt-6 text-[10px] text-slate-600 font-bold uppercase hover:text-white transition-colors">Dismiss</button>
+    </div>
+  </div>
+
+  <script>
+    lucide.createIcons();
+    let currentEngineSide = null;
+
+    const engineMap = [
+      { id: 'bull', name: 'Breakout (Bullish)', color: 'emerald' },
+      { id: 'mom_bull', name: 'Momentum (Bullish)', color: 'blue' },
+      { id: 'bear', name: 'Breakdown (Bearish)', color: 'rose' },
+      { id: 'mom_bear', name: 'Momentum (Bearish)', color: 'orange' }
+    ];
+
+    function isBreakoutSide(side) {
+      return side === 'bull' || side === 'bear';
+    }
+
+    function tvLink(symbol) {
+      return `https://www.tradingview.com/chart/?symbol=NSE:${encodeURIComponent(symbol)}`;
+    }
+
+    function fmt2(n) { return (typeof n === 'number' && isFinite(n)) ? n.toFixed(2) : '--'; }
+
+    // Default matrix (10 levels)
+    function defaultMatrix() {
+      const minCr = Array.from({length: 10}, (_, i) => i + 1);
+      const mult = [20,18,16,14,12,10,8,6,4,2];
+      return Array.from({length: 10}, (_, i) => ({
+        min_vol_price_cr: minCr[i],
+        sma_multiplier: mult[i],
+        min_sma_avg: 1000
+      }));
+    }
+
+    function applyMatrixDefaults() {
+      const container = document.getElementById('volume-levels-container');
+      const matrix = defaultMatrix();
+      container.innerHTML = '';
+      for(let i=0; i<10; i++) {
+        const row = matrix[i];
+        container.insertAdjacentHTML('beforeend', `
+          <div class="grid grid-cols-4 gap-3 bg-slate-900/50 p-2 rounded border border-slate-800">
+            <div class="text-[9px] font-black text-slate-600 flex items-center justify-center">L${i+1}</div>
+            <input class="v-cr matrix-input" type="number" step="0.1" value="${row.min_vol_price_cr}">
+            <input class="v-sma matrix-input" type="number" step="0.1" value="${row.sma_multiplier}">
+            <input class="v-avg matrix-input" type="number" value="${row.min_sma_avg}">
+          </div>
+        `);
+      }
+      lucide.createIcons();
+    }
+
+    // --- Initialize Dashboard Components ---
+    function initEngines() {
+      const grid = document.getElementById('engine-grid');
+      grid.innerHTML = '';
+      engineMap.forEach(eng => {
+        grid.insertAdjacentHTML('beforeend', `
+          <section class="glass-panel p-4 rounded-2xl border-t-2 border-${eng.color}-600">
+            <div class="flex justify-between items-center mb-4">
+              <div class="flex items-center gap-2">
+                <div class="w-2 h-2 rounded-full bg-${eng.color}-500 shadow-[0_0_5px_rgba(0,0,0,0.5)]"></div>
+                <span class="text-[10px] font-black uppercase text-slate-300 tracking-tight">${eng.name}</span>
+              </div>
+              <div class="flex items-center gap-3">
+                <span id="${eng.id}-pnl-side" class="text-xs font-black px-2 tabular-nums">0.00</span>
+
+                <button class="icon-btn icon-danger" title="Square off ALL open positions in this engine"
+                  onclick="squareOffAll('${eng.id}')">
+                  <i data-lucide="log-out" class="w-4 h-4 text-rose-400"></i>
                 </button>
-            </div>
-        </div>
-    </div>
 
-    <!-- MODAL: API CONFIG -->
-    <div id="api-modal" class="fixed inset-0 bg-black/95 flex items-center justify-center z-50 hidden p-4 backdrop-blur-xl">
-        <div class="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-sm p-10 shadow-2xl text-center">
-            <h3 class="text-lg font-bold text-white mb-2 uppercase italic tracking-tighter">Auth Gateway</h3>
-            <p class="text-[10px] text-slate-500 mb-8 uppercase tracking-[0.3em]">HFT Session Link</p>
+                <label class="switch" title="Toggle new entries (open trades keep monitoring)">
+                  <input type="checkbox" id="toggle-${eng.id}" onchange="handleToggle('${eng.id}')">
+                  <span class="slider"></span>
+                </label>
 
-            <div class="space-y-4 mb-8">
-                <input id="api-key-input" placeholder="KITE API KEY" class="matrix-input !h-11 px-4 !bg-black">
-                <input id="api-secret-input" type="password" placeholder="KITE API SECRET" class="matrix-input !h-11 px-4 !bg-black">
+                <button onclick="openSettings('${eng.id}')" class="text-[8px] bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded font-bold border border-slate-700 uppercase">Config</button>
+              </div>
             </div>
 
-            <button onclick="saveApi()" class="w-full bg-blue-600 py-3 rounded-xl font-black text-xs uppercase mb-3 transition-all hover:scale-105">Save Config</button>
-            <button onclick="window.location.href='/login'" class="w-full bg-emerald-600/10 border border-emerald-600/30 text-emerald-500 py-2.5 rounded-xl text-[10px] font-bold uppercase hover:bg-emerald-600/20">Initiate OAuth</button>
+            <div class="bg-black/40 rounded-xl border border-slate-800 overflow-hidden min-h-[140px]">
+              <table class="w-full text-left text-[9px]">
+                <thead class="bg-slate-900/80 text-slate-500 font-bold uppercase tracking-tighter">
+                  <tr>
+                    <th class="px-3 py-2">Stock</th>
+                    <th class="px-3 py-2 text-center">Entry</th>
+                    <th class="px-3 py-2 text-center">Target</th>
+                    <th class="px-3 py-2 text-right">PnL</th>
+                    <th class="px-3 py-2 text-right">Exit</th>
+                  </tr>
+                </thead>
+                <tbody id="${eng.id}-tbody" class="divide-y divide-slate-800/50">
+                  <tr><td colspan="5" class="py-12 text-center text-slate-800 italic text-[10px]">No Active Position</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        `);
+      });
+      lucide.createIcons();
+    }
 
-            <button onclick="document.getElementById('api-modal').classList.add('hidden')" class="mt-6 text-[10px] text-slate-600 font-bold uppercase hover:text-white">Close</button>
-        </div>
-    </div>
+    // -----------------------------
+    // ✅ PARALLEL HTTP SYNC (UI side)
+    // - We already do Promise.all => parallel
+    // - Add: stale-response guard + timeout + health badge
+    // -----------------------------
+    let syncInFlight = false;
+    let syncSeq = 0;
+    const SYNC_INTERVAL_MS = 1500;
+    const HTTP_TIMEOUT_MS = 4000;
 
-    <script>
+    function setBadge(id, cls, text) {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.className = `badge ${cls}`;
+      el.innerText = text;
+    }
+
+    function updateDot(id, active) {
+      document.getElementById(id).className =
+        `w-2 h-2 rounded-full ${active ? 'bg-emerald-500 shadow-[0_0_8px_#10b981]' : 'bg-red-600'}`;
+    }
+
+    function addLog(msg) {
+      const div = document.createElement('div');
+      div.className = 'log-line';
+      div.innerText = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      document.getElementById('log-container').prepend(div);
+    }
+
+    async function runSyncParallel() {
+      // allow overlap? no. we keep it clean and avoid piling up requests
+      if (syncInFlight) return;
+      syncInFlight = true;
+      const mySeq = ++syncSeq;
+
+      const started = performance.now();
+      document.getElementById('ui-last-refresh').innerText = new Date().toLocaleTimeString();
+
+      try {
+        const client = axios.create({ timeout: HTTP_TIMEOUT_MS });
+
+        const [statsRes, ordersRes, scanRes] = await Promise.all([
+          client.get('/api/stats'),
+          client.get('/api/orders'),
+          client.get('/api/scanner')
+        ]);
+
+        // stale response guard (if you later allow overlap)
+        if (mySeq !== syncSeq) return;
+
+        const ms = Math.round(performance.now() - started);
+        setBadge('sync-health', ms < 1200 ? 'badge-ok' : 'badge-warn', `SYNC ${ms}ms`);
+
+        // Global stats
+        const stats = statsRes.data || {};
+        const total = (stats.pnl && typeof stats.pnl.total === 'number') ? stats.pnl.total : 0;
+
+        const totalPnlEl = document.getElementById('total-pnl');
+        totalPnlEl.innerText = `₹ ${Number(total).toFixed(2)}`;
+        totalPnlEl.className = `text-xl font-black tabular-nums ${total >= 0 ? 'text-emerald-400' : 'text-rose-500'}`;
+
+        updateDot('dot-brk', !!(stats.data_connected && stats.data_connected.breakout));
+        updateDot('dot-mom', !!(stats.data_connected && stats.data_connected.momentum));
+
+        // Feed status label
+        const feed = document.getElementById('feed-status');
+        const connected = !!(stats.data_connected && (stats.data_connected.breakout || stats.data_connected.momentum));
+        feed.innerText = connected ? 'Connected' : 'Disconnected';
+        feed.className = `text-[10px] font-mono font-bold uppercase ${connected ? 'text-emerald-500' : 'text-rose-400'}`;
+
+        // Toggles + side PnL
+        engineMap.forEach(e => {
+          const on = stats.engine_status && stats.engine_status[e.id] === "1";
+          const pnl = (stats.pnl && typeof stats.pnl[e.id] === 'number') ? stats.pnl[e.id] : 0;
+
+          document.getElementById(`toggle-${e.id}`).checked = !!on;
+          const el = document.getElementById(`${e.id}-pnl-side`);
+          el.innerText = Number(pnl).toFixed(2);
+          el.className = `text-xs font-black px-2 tabular-nums ${pnl >= 0 ? 'text-emerald-400' : 'text-rose-500'}`;
+        });
+
+        // Orders (OPEN-only rendering)
+        // Backend should ideally return OPEN-only, but we also filter in UI for safety.
+        const orders = ordersRes.data || {};
+        engineMap.forEach(e => {
+          const tbody = document.getElementById(`${e.id}-tbody`);
+          const raw = Array.isArray(orders[e.id]) ? orders[e.id] : [];
+          const data = raw.filter(t => !t.status || t.status === "OPEN");  // OPEN-only display
+
+          if (data.length > 0) {
+            tbody.innerHTML = data.map(t => `
+              <tr class="hover:bg-blue-600/5 transition-colors">
+                <td class="px-3 py-2 font-bold text-white">
+                  <a href="${tvLink(t.symbol)}" target="_blank" class="underline decoration-slate-700 hover:decoration-blue-500">${t.symbol}</a>
+                </td>
+                <td class="px-3 py-2 text-center text-blue-400 font-mono">₹${Number(t.entry_price).toFixed(2)}</td>
+                <td class="px-3 py-2 text-center text-emerald-500 font-mono">₹${Number(t.target_price).toFixed(2)}</td>
+                <td class="px-3 py-2 text-right font-black tabular-nums ${Number(t.pnl||0) >= 0 ? 'text-emerald-400' : 'text-rose-500'}">₹${Number(t.pnl||0).toFixed(2)}</td>
+                <td class="px-3 py-2 text-right">
+                  <button class="icon-btn icon-danger" title="Square off this position" onclick="squareOffOne('${e.id}', '${t.symbol}')">
+                    <i data-lucide="x" class="w-4 h-4 text-rose-400"></i>
+                  </button>
+                </td>
+              </tr>
+            `).join('');
+          } else {
+            tbody.innerHTML = '<tr><td colspan="5" class="py-12 text-center text-slate-800 italic text-[10px]">No Active Position</td></tr>';
+          }
+        });
+
+        // Scanner (unified)
+        const scan = scanRes.data || {};
+        const scannerCont = document.getElementById('unified-scanner');
+
+        let allSignals = [];
+        engineMap.forEach(e => {
+          const arr = Array.isArray(scan[e.id]) ? scan[e.id] : [];
+          arr.forEach(s => allSignals.push({ ...s, type: e.name, color: e.color, sideId: e.id }));
+        });
+
+        allSignals.sort((a,b) => (b.seen_ts || 0) - (a.seen_ts || 0));
+        document.getElementById('scan-count').innerText = `${allSignals.length} STOCKS`;
+
+        if (allSignals.length > 0) {
+          scannerCont.innerHTML = allSignals.map(s => {
+            const pct = (typeof s.pct_change === 'number') ? s.pct_change : null;
+            const pctCls = (pct ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400';
+
+            const rel = (typeof s.rel_vol === 'number' && isFinite(s.rel_vol)) ? s.rel_vol : null;
+            const relTxt = rel === null ? '--' : rel.toFixed(2) + 'x';
+
+            const volTxt = (typeof s.volume === 'number' && isFinite(s.volume)) ? Math.round(s.volume).toLocaleString() : '--';
+            const seen = s.seen_time || '--:--:--';
+            const link = s.chart_url || tvLink(s.symbol);
+
+            return `
+              <div class="p-3 rounded-xl scanner-card border-l-4 border-${s.color}-500">
+                <div class="flex justify-between items-start">
+                  <a href="${link}" target="_blank" class="text-xs font-black text-white flex items-center gap-2 hover:text-blue-300">
+                    ${s.symbol}
+                    <i data-lucide="external-link" class="w-3 h-3 text-slate-400"></i>
+                  </a>
+                  <span class="text-[7px] font-black uppercase text-blue-400 bg-blue-400/10 px-1 rounded-sm">${String(s.sideId||'').toUpperCase()}</span>
+                </div>
+
+                <div class="grid grid-cols-2 gap-2 mt-2">
+                  <div class="text-[9px] text-slate-400 font-bold">
+                    Seen: <span class="text-slate-200 mono">${seen}</span>
+                  </div>
+                  <div class="text-[9px] text-slate-400 font-bold text-right">
+                    %Chg: <span class="${pctCls} mono">${pct === null ? '--' : pct.toFixed(2)}%</span>
+                  </div>
+
+                  <div class="text-[9px] text-slate-400 font-bold">
+                    Vol: <span class="text-slate-200 mono">${volTxt}</span>
+                  </div>
+                  <div class="text-[9px] text-slate-400 font-bold text-right">
+                    RelVol: <span class="text-slate-200 mono">${relTxt}</span>
+                  </div>
+                </div>
+
+                <div class="flex justify-between items-end mt-2">
+                  <span class="text-[8px] text-slate-600 font-bold uppercase italic">${s.reason || 'Candle Confirmed'}</span>
+                  <span class="text-[10px] font-mono text-blue-400 font-bold tracking-tighter">
+                    Trigger: ₹${fmt2(s.trigger_px ?? s.price)}
+                  </span>
+                </div>
+              </div>
+            `;
+          }).join('');
+        } else {
+          scannerCont.innerHTML = '<div class="text-center py-20 text-slate-700 italic text-[10px]">Scanning ticks...</div>';
+        }
+
         lucide.createIcons();
-        let currentEngineSide = null;
 
-        const engineMap = [
-            { id: 'bull', name: 'Breakout (Bullish)', color: 'emerald' },
-            { id: 'mom_bull', name: 'Momentum (Bullish)', color: 'blue' },
-            { id: 'bear', name: 'Breakdown (Bearish)', color: 'rose' },
-            { id: 'mom_bear', name: 'Momentum (Bearish)', color: 'orange' }
-        ];
+      } catch (e) {
+        setBadge('sync-health', 'badge-bad', 'SYNC FAIL');
+        // keep console detail but also a small UI log
+        addLog('SYNC ERROR: check /api endpoints & server logs');
+        console.error("Sync Error", e);
+      } finally {
+        syncInFlight = false;
+      }
+    }
 
-        // --- Layout Initialization ---
-        function initEngines() {
-            const grid = document.getElementById('engine-grid');
-            grid.innerHTML = '';
-            engineMap.forEach(eng => {
-                grid.insertAdjacentHTML('beforeend', `
-                    <section class="glass-panel p-4 rounded-2xl border-t-2 border-${eng.color}-600">
-                        <div class="flex justify-between items-center mb-4">
-                            <div class="flex items-center gap-2">
-                                <div class="w-2 h-2 rounded-full bg-${eng.color}-500 shadow-[0_0_8px_rgba(0,0,0,0.5)]"></div>
-                                <span class="text-[10px] font-black uppercase text-slate-300">${eng.name}</span>
-                            </div>
-                            <div class="flex items-center gap-3">
-                                <span id="${eng.id}-side-pnl" class="text-xs font-black px-2 tabular-nums">₹ 0.00</span>
-                                <button class="icon-btn icon-danger" onclick="squareOffAll('${eng.id}')" title="Square off side"><i data-lucide="log-out" class="w-3 h-3 text-rose-400"></i></button>
-                                <label class="switch"><input type="checkbox" id="toggle-${eng.id}" onchange="handleToggle('${eng.id}')"><span class="slider"></span></label>
-                                <button onclick="openSettings('${eng.id}')" class="text-[8px] bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded font-bold border border-slate-700 uppercase">Config</button>
-                            </div>
-                        </div>
-                        <div class="bg-black/40 rounded-xl border border-slate-800 overflow-hidden min-h-[120px]">
-                            <table class="w-full text-left text-[9px]">
-                                <thead class="bg-slate-900/80 text-slate-500 font-bold uppercase tracking-tighter">
-                                    <tr>
-                                        <th class="px-3 py-2">Stock</th>
-                                        <th class="px-3 py-2 text-center">Entry</th>
-                                        <th class="px-3 py-2 text-center">Target</th>
-                                        <th class="px-3 py-2 text-right">PnL</th>
-                                        <th class="px-3 py-2 text-right">Exit</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="${eng.id}-tbody" class="divide-y divide-slate-800/50">
-                                    <tr><td colspan="5" class="py-10 text-center text-slate-800 italic text-[10px]">No Active Trades</td></tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </section>
-                `);
-            });
-            lucide.createIcons();
-        }
+    // --- Interaction Handlers ---
+    async function handleToggle(side) {
+      const enabled = document.getElementById(`toggle-${side}`).checked;
+      await axios.post('/api/control', { action: 'toggle_engine', side, enabled });
+      addLog(`ENGINE: ${side.toUpperCase()} set to ${enabled ? 'ONLINE' : 'OFFLINE'}`);
+    }
 
-        // --- Core Data Sync ---
-        async function runSync() {
-            try {
-                const [statsRes, ordersRes, scanRes] = await Promise.all([
-                    axios.get('/api/stats'),
-                    axios.get('/api/orders'),
-                    axios.get('/api/scanner')
-                ]);
+    async function squareOffOne(side, symbol) {
+      try {
+        await axios.post('/api/control', { action: 'square_off_one', side, symbol });
+        addLog(`EXIT ONE: ${side.toUpperCase()} ${symbol}`);
+      } catch (e) {
+        addLog(`EXIT ONE FAILED: ${symbol}`);
+      }
+    }
 
-                const stats = statsRes.data;
-                const totalPnl = Number(stats.pnl?.total || 0);
-                document.getElementById('total-pnl').innerText = `₹ ${totalPnl.toFixed(2)}`;
-                document.getElementById('total-pnl').className = `text-xl font-black tabular-nums ${totalPnl >= 0 ? 'text-emerald-400' : 'text-rose-500'}`;
-                
-                document.getElementById('stat-stocks').innerText = stats.stock_count;
-                document.getElementById('stat-queue').innerText = stats.queue_size;
-                document.getElementById('stat-time').innerText = stats.server_time;
+    async function squareOffAll(side) {
+      try {
+        await axios.post('/api/control', { action: 'square_off_all', side });
+        addLog(`EXIT ALL: ${side.toUpperCase()} positions requested`);
+      } catch (e) {
+        addLog(`EXIT ALL FAILED: ${side}`);
+      }
+    }
 
-                updateDot('dot-feed', stats.connected);
+    async function openSettings(side) {
+      currentEngineSide = side;
+      document.getElementById('modal-title').innerText = `${side.toUpperCase()} Logic Configuration`;
 
-                engineMap.forEach(e => {
-                    const on = (stats.engine_status?.[e.id] === "1");
-                    const sidePnl = Number(stats.pnl?.[e.id] || 0);
-                    document.getElementById(`toggle-${e.id}`).checked = on;
-                    const pnlSide = document.getElementById(`${e.id}-side-pnl`);
-                    pnlSide.innerText = `₹ ${sidePnl.toFixed(2)}`;
-                    pnlSide.className = `text-xs font-black px-2 tabular-nums ${sidePnl >= 0 ? 'text-emerald-400' : 'text-rose-500'}`;
+      const timeBox = document.getElementById('breakout-time-box');
+      if (isBreakoutSide(side)) timeBox.classList.remove('hidden');
+      else timeBox.classList.add('hidden');
 
-                    // Update Orders for this side
-                    const tbody = document.getElementById(`${e.id}-tbody`);
-                    const activeOrders = (ordersRes.data[e.id] || []).filter(t => t.status === "OPEN");
-                    if (activeOrders.length > 0) {
-                        tbody.innerHTML = activeOrders.map(t => `
-                            <tr>
-                                <td class="px-3 py-2 font-bold text-white">${t.symbol}</td>
-                                <td class="px-3 py-2 text-center text-blue-400">₹${Number(t.entry_price || t.entry).toFixed(2)}</td>
-                                <td class="px-3 py-2 text-center text-emerald-500">₹${Number(t.target_price || 0).toFixed(2)}</td>
-                                <td class="px-3 py-2 text-right font-bold ${Number(t.pnl) >= 0 ? 'text-emerald-400' : 'text-rose-500'}">₹${Number(t.pnl).toFixed(2)}</td>
-                                <td class="px-3 py-2 text-right">
-                                    <button class="icon-btn icon-danger" onclick="squareOffOne('${e.id}', '${t.symbol}')"><i data-lucide="x" class="w-3 h-3 text-rose-400"></i></button>
-                                </td>
-                            </tr>
-                        `).join('');
-                    } else {
-                        tbody.innerHTML = '<tr><td colspan="5" class="py-10 text-center text-slate-800 italic text-[10px]">No Active Trades</td></tr>';
-                    }
-                });
+      const res = await axios.get(`/api/settings/engine/${side}`);
+      const cfg = res.data || {};
 
-                // Update Scanner (Pre-trigger watch)
-                const scanner = document.getElementById('unified-scanner');
-                let allSignals = [];
-                engineMap.forEach(e => {
-                    (scanRes.data[e.id] || []).forEach(s => allSignals.push({...s, color: e.color, sideName: e.id.toUpperCase()}));
-                });
-                
-                if(allSignals.length > 0) {
-                    document.getElementById('scan-count').innerText = `${allSignals.length} STOCKS`;
-                    scanner.innerHTML = allSignals.map(s => `
-                        <div class="p-3 rounded-xl scanner-card border-l-4 border-${s.color}-500 mb-2">
-                            <div class="flex justify-between items-start">
-                                <span class="text-xs font-black text-white">${s.symbol}</span>
-                                <span class="text-[7px] font-black uppercase text-blue-400 bg-blue-400/10 px-1 rounded-sm">${s.sideName}</span>
-                            </div>
-                            <div class="flex justify-between items-end mt-2">
-                                <span class="text-[8px] text-slate-500 italic">${s.seen_time}</span>
-                                <span class="text-[10px] font-bold text-blue-400">Trig: ₹${Number(s.trigger_px).toFixed(2)}</span>
-                            </div>
-                        </div>
-                    `).join('');
-                } else {
-                    scanner.innerHTML = '<div class="text-center py-20 text-slate-700 italic text-[10px]">Scanning universe...</div>';
-                }
-                lucide.createIcons();
-            } catch (e) { console.error("Sync Error", e); }
-        }
+      document.getElementById('inp-rr').value = cfg.risk_reward || '1:2';
+      document.getElementById('inp-tsl').value = cfg.trailing_sl || '1:1.5';
+      document.getElementById('inp-max-trades').value = cfg.total_trades || 5;
+      document.getElementById('inp-risk').value = cfg.risk_trade_1 || 2000;
 
-        // --- Interaction Handlers ---
-        async function handleToggle(side) {
-            const enabled = document.getElementById(`toggle-${side}`).checked;
-            await axios.post('/api/control', { action: 'toggle_engine', side, enabled });
-            addLog(`ENGINE: ${side.toUpperCase()} set to ${enabled ? 'ONLINE' : 'OFFLINE'}`, "blue-400");
-        }
+      // ✅ FIX: trade_start_time/trade_end_time -> trade_start/trade_end
+      if (isBreakoutSide(side)) {
+        document.getElementById('inp-start').value = cfg.trade_start || '09:15';
+        document.getElementById('inp-end').value = cfg.trade_end || '15:10';
+      }
 
-        async function squareOffOne(side, symbol) {
-            await axios.post('/api/control', { action: 'square_off_one', side, symbol });
-            addLog(`EXIT REQUESTED: ${symbol} (${side.toUpperCase()})`, "orange-400");
-        }
+      const container = document.getElementById('volume-levels-container');
+      container.innerHTML = '';
 
-        async function openSettings(side) {
-            currentEngineSide = side;
-            document.getElementById('modal-title').innerText = `${side.toUpperCase()} LOGIC CONFIG`;
-            const res = await axios.get(`/api/settings/engine/${side}`);
-            const cfg = res.data;
-            
-            document.getElementById('inp-rr').value = cfg.risk_reward || '1:2';
-            document.getElementById('inp-tsl').value = cfg.trailing_sl || '1:1.5';
-            document.getElementById('inp-max-trades').value = cfg.total_trades || 5;
-            document.getElementById('inp-risk').value = cfg.risk_trade_1 || 2000;
-            
-            const container = document.getElementById('volume-levels-container');
-            container.innerHTML = '';
-            let matrix = cfg.volume_criteria || defaultMatrix();
-            matrix.forEach((lvl, i) => {
-                container.insertAdjacentHTML('beforeend', `
-                    <div class="grid grid-cols-4 gap-2">
-                        <div class="text-[9px] font-black text-slate-700 flex items-center justify-center">Tier ${i+1}</div>
-                        <input class="v-cr matrix-input" type="number" step="0.1" value="${lvl.min_vol_price_cr}">
-                        <input class="v-sma matrix-input" type="number" step="0.1" value="${lvl.sma_multiplier}">
-                        <input class="v-avg matrix-input" type="number" value="${lvl.min_sma_avg}">
-                    </div>
-                `);
-            });
-            document.getElementById('settings-modal').classList.remove('hidden');
-        }
+      let matrix = Array.isArray(cfg.volume_criteria) ? cfg.volume_criteria : [];
+      const emptyMatrix = !matrix.length || matrix.every(r =>
+        (!r || (Number(r.min_vol_price_cr||0)===0 && Number(r.sma_multiplier||0)===0 && Number(r.min_sma_avg||0)===0))
+      );
+      if (emptyMatrix) matrix = defaultMatrix();
 
-        async function saveSettings() {
-            const crs = document.querySelectorAll('.v-cr'), smas = document.querySelectorAll('.v-sma'), avgs = document.querySelectorAll('.v-avg');
-            const matrix = Array.from(crs).map((el, i) => ({
-                min_vol_price_cr: parseFloat(el.value),
-                sma_multiplier: parseFloat(smas[i].value),
-                min_sma_avg: parseInt(avgs[i].value)
-            }));
+      for (let i=0; i<10; i++) {
+        const row = matrix[i] || defaultMatrix()[i];
+        container.insertAdjacentHTML('beforeend', `
+          <div class="grid grid-cols-4 gap-3 bg-slate-900/50 p-2 rounded border border-slate-800">
+            <div class="text-[9px] font-black text-slate-600 flex items-center justify-center">L${i+1}</div>
+            <input class="v-cr matrix-input" type="number" step="0.1" value="${row.min_vol_price_cr}">
+            <input class="v-sma matrix-input" type="number" step="0.1" value="${row.sma_multiplier}">
+            <input class="v-avg matrix-input" type="number" value="${row.min_sma_avg}">
+          </div>
+        `);
+      }
 
-            await axios.post(`/api/settings/engine/${currentEngineSide}`, {
-                risk_reward: document.getElementById('inp-rr').value,
-                trailing_sl: document.getElementById('inp-tsl').value,
-                total_trades: parseInt(document.getElementById('inp-max-trades').value),
-                risk_trade_1: parseInt(document.getElementById('inp-risk').value),
-                volume_criteria: matrix
-            });
-            closeSettings();
-            addLog(`REDIS: Configuration updated for ${currentEngineSide.toUpperCase()}`, "emerald-400");
-        }
+      document.getElementById('settings-modal').classList.remove('hidden');
+      lucide.createIcons();
+    }
 
-        function defaultMatrix() {
-            return Array.from({length: 10}, (_, i) => ({ min_vol_price_cr: i+1, sma_multiplier: 20-(i*2), min_sma_avg: 1000 }));
-        }
+    async function saveSettings() {
+      const vCr = document.querySelectorAll('.v-cr'),
+            vSma = document.querySelectorAll('.v-sma'),
+            vAvg = document.querySelectorAll('.v-avg');
 
-        function applyMatrixDefaults() {
-            const container = document.getElementById('volume-levels-container');
-            container.innerHTML = '';
-            defaultMatrix().forEach((lvl, i) => {
-                container.insertAdjacentHTML('beforeend', `<div class="grid grid-cols-4 gap-2"><div class="text-[9px] font-black text-slate-700 flex items-center justify-center">Tier ${i+1}</div><input class="v-cr matrix-input" type="number" step="0.1" value="${lvl.min_vol_price_cr}"><input class="v-sma matrix-input" type="number" step="0.1" value="${lvl.sma_multiplier}"><input class="v-avg matrix-input" type="number" value="${lvl.min_sma_avg}"></div>`);
-            });
-        }
+      const matrix = Array.from(vCr).map((el, i) => ({
+        min_vol_price_cr: parseFloat(el.value) || 0,
+        sma_multiplier: parseFloat(vSma[i].value) || 1.0,
+        min_sma_avg: parseInt(vAvg[i].value) || 0
+      }));
 
-        async function saveApi() {
-            const api_key = document.getElementById('api-key-input').value;
-            const api_secret = document.getElementById('api-secret-input').value;
-            await axios.post('/api/control', { action: 'save_api', api_key, api_secret });
-            document.getElementById('api-modal').classList.add('hidden');
-            addLog("API: Credentials cached and broadcasted.", "blue-400");
-        }
+      const payload = {
+        risk_reward: document.getElementById('inp-rr').value,
+        trailing_sl: document.getElementById('inp-tsl').value,
+        total_trades: Number(document.getElementById('inp-max-trades').value || 5),
+        risk_trade_1: Number(document.getElementById('inp-risk').value || 2000),
+        volume_criteria: matrix
+      };
 
-        function openApiModal() { document.getElementById('api-modal').classList.remove('hidden'); }
-        function closeSettings() { document.getElementById('settings-modal').classList.add('hidden'); }
-        function updateDot(id, active) { document.getElementById(id).className = `w-2 h-2 rounded-full ${active ? 'bg-emerald-500 shadow-[0_0_8px_#10b981]' : 'bg-red-600'}`; }
-        
-        function addLog(msg, color="slate-400") {
-            const div = document.createElement('div');
-            div.className = `log-line text-${color}`;
-            div.innerHTML = `<span class="text-slate-600">[${new Date().toLocaleTimeString()}]</span> ${msg}`;
-            document.getElementById('log-container').prepend(div);
-        }
+      // ✅ FIX: trade_start/trade_end (not trade_start_time/trade_end_time)
+      if (isBreakoutSide(currentEngineSide)) {
+        payload.trade_start = document.getElementById('inp-start').value || '09:15';
+        payload.trade_end = document.getElementById('inp-end').value || '15:10';
+      }
 
-        // Init
-        initEngines();
-        setInterval(runSync, 1500);
-    </script>
+      await axios.post(`/api/settings/engine/${currentEngineSide}`, payload);
+      addLog(`SETTINGS SAVED: ${currentEngineSide}`);
+      closeSettings();
+    }
+
+    async function saveApi() {
+      const api_key = document.getElementById('api-key-input').value;
+      const api_secret = document.getElementById('api-secret-input').value;
+      await axios.post('/api/control', { action: 'save_api', api_key, api_secret });
+      addLog("AUTH: API Credentials saved to Redis.");
+      document.getElementById('api-modal').classList.add('hidden');
+    }
+
+    function openApiModal() { document.getElementById('api-modal').classList.remove('hidden'); }
+    function closeSettings() { document.getElementById('settings-modal').classList.add('hidden'); }
+
+    // Initialize
+    initEngines();
+    applyMatrixDefaults();
+
+    // "parallel processing integration" on UI:
+    // ✅ Promise.all fetches in parallel
+    // ✅ single-flight guard prevents overlapping bursts
+    runSyncParallel();
+    setInterval(runSyncParallel, SYNC_INTERVAL_MS);
+  </script>
 </body>
 </html>

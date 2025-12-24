@@ -1,278 +1,239 @@
+# sync_market_data.py
 import asyncio
 import os
 import logging
-import json
 from datetime import datetime, timedelta
-from typing import List, Dict
+from typing import Dict, List, Tuple, Optional
 
 import pytz
 from kiteconnect import KiteConnect
 
-# Internal component import
-from redis_manager import TradeControl, IST
+from redis_manager import TradeControl
 
-# --- LOGGING SETUP ---
+# -----------------------------
+# LOGGING
+# -----------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] Sync_Market: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    format="%(asctime)s [ASYNC-SYNC] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("Nexus_Sync")
+logger = logging.getLogger("Sync_Command")
+IST = pytz.timezone("Asia/Kolkata")
 
-# --- CONFIGURATION ---
-# Aap apni watchlist yahan add kar sakte hain
-WATCHLIST = [
-    'MRF', '3MINDIA', 'HONAUT', 'ABBOTINDIA', 'JSWHL', 'POWERINDIA', 'PTCIL', 'FORCEMOT', 'NEULANDLAB', 'LMW',
-    'TVSHLTD', 'MAHSCOOTER', 'ZFCVINDIA', 'PGHH', 'BAJAJHLDNG', 'DYNAMATECH', 'ASTRAZEN', 'APARINDS', 'GILLETTE', 'WENDT',
-    'TASTYBITE', 'VOLTAMP', 'CRAFTSMAN', 'NSIL', 'ESABINDIA', 'NAVINFLUOR', 'ICRA', 'LINDEINDIA', 'ATUL', 'VSTTILLERS',
-    'JKCEMENT', 'PGHL', 'LUMAXIND', 'BLUEDART', 'CERA', 'PILANIINVS', 'FOSECOIND', 'VADILALIND', 'KICL', 'PFIZER',
-    'SUNDARMFIN', 'ORISSAMINE', 'LTTS', 'SANOFICONR', 'CRISIL', 'ECLERX', 'FINEORG', 'BAYERCROP', 'TVSSRICHAK', 'SANOFI',
-    'SHILCTECH', 'BASF', 'KINGFA', 'SCHAEFFLER', 'SMLMAH', 'AIAENG', 'CEATLTD', 'SWARAJENG', 'GRWRHITECH', 'ESCORTS',
-    'BANARISUG', 'AKZOINDIA', 'INGERRAND', 'VHL', 'FLUOROCHEM', 'KIRLOSIND', 'KMEW', 'RADICO', 'NETWEB', 'THANGAMAYL',
-    'SHRIPISTON', 'PRIVISCL', 'TIMKEN', 'GVT&D', 'ETHOSLTD', 'TCPLPACK', 'WAAREEENER', 'ANANDRATHI', 'NDGL', 'ENRIN',
-    'LALPATHLAB', 'THERMAX', 'GODFRYPHLP', 'BBL', 'CARTRADE', 'AJANTPHARM', 'BHARATRAS', 'ENDURANCE', 'PRUDENT', 'AIIL',
-    'GLAXO', 'DATAPATTNS', 'DOMS', 'RATNAMANI', 'SHAILY', 'INTERARCH', 'GRSE', 'HONDAPOWER', 'BALKRISIND', 'MTARTECH',
-    'HYUNDAI', 'JUBLCPL', 'COROMANDEL', 'RPGLIFE', 'KDDL', 'CENTUM', 'FIEMIND', 'SAFARI', 'NBIFIN', 'POWERMECH',
-    'INDIAMART', 'V2RETAIL', 'STYLAMIND', 'ANUP', 'TIIL', 'MASTEK', 'E2E', 'STYRENIX', 'MPSLTD', 'GALAXYSURF',
-    'SUMMITSEC', 'CAPLIPOINT', 'CHOLAHLDNG', 'TEGA', 'METROPOLIS', 'LGBBROSLTD', 'POLYMED', 'AUTOAXLES', 'NH', 'BBTC',
-    'GRAVITA', 'SKFINDIA', 'CIGNITITEC', 'TATACOMM', 'JBCHEPHARM', 'GRPLTD', 'ACC', 'GKWLIMITED', 'SANSERA', 'BEML',
-    'AFFLE', 'BHARTIHEXA', 'GLAND', 'ABREL', 'ZOTA', 'SJS', 'ACUTAAS', 'TBOTEK', 'UBL', 'IKS',
-    'MAPMYINDIA', 'BETA', 'KIRLOSBROS', 'VEEDOL', 'ONESOURCE', 'IFBIND', 'AZAD', 'HESTERBIO', 'TEAMLEASE', 'COCHINSHIP',
-    'INDOTECH', 'THEJO', 'ALKYLAMINE', 'VINATIORGA', 'PGIL', 'GRINDWELL', 'YASHO', 'ERIS', 'LGEINDIA', 'AAVAS',
-    'BIRLANU', 'CPPLUS', 'CARERATING', 'EIMCOELECO', 'DEEPAKNTR', 'JINDALPHOT', 'PIRAMALFIN', 'SOLEX', 'HIRECT', 'ARMANFIN',
-    'LUMAXTECH', 'IPCALAB', 'MIDWESTLTD', 'PIXTRANS', 'NPST', 'SOBHA', 'EMCURE', 'TATVA', 'DPABHUSHAN', 'WELINV',
-    'JCHAC', 'RRKABEL', 'VENKEYS', 'NILKAMAL', 'JLHL', 'VINDHYATEL', 'EPIGRAL', 'IMFA', 'ZENTEC', 'RAINBOW',
-    'CONCORDBIO', 'RANEHOLDIN', 'MANORAMA', 'WOCKPHARMA', 'NGLFINE', 'ACCELYA', 'ANURAS', 'POCL', 'CREDITACC', 'LLOYDSME',
-    'TRAVELFOOD', 'AMBIKCO', 'SUNCLAY', 'PUNJABCHEM', 'IFBAGRO', 'VENUSPIPES', 'WABAG', 'DCMSHRIRAM', 'NESCO', 'DEEPAKFERT',
-    'INDIGOPNTS', 'SASKEN', 'DODLA', 'SPECTRUM', 'OLECTRA', 'DHANUKA', 'APOLSINHOT', 'HOMEFIRST', 'KPIL', 'METROBRAND',
-    'DHUNINV', 'GULFOILLUB', 'MALLCOM', 'MEDANTA', 'AURIONPRO', 'UTIAMC', 'KIRLOSENG', 'INOXINDIA', 'RAYMONDLSL', 'MGL',
-    'SIGNATURE', 'BALAMINES', 'LUXIND', 'GESHIP', 'TECHNOE', 'NIBE', 'GOODLUCK', 'JPOLYINVST', 'NEOGEN', 'DIAMONDYD',
-    'JUBLPHARMA', 'ADOR', 'GMMPFAUDLR', 'HAPPYFORGE', 'BIRLACORPN', 'INDIAGLYCO', 'SANDESH', 'TTKHLTCARE', 'CHEVIOT', 'RAMCOCEM',
-    'KAJARIACER', 'PVRINOX', 'TCI', 'RACLGEAR', 'KIRLPNU', 'IMPAL', 'EIDPARRY', 'DREDGECORP', 'INTELLECT', 'SEAMECLTD',
-    'KERNEX', 'GRINFRA', 'CCL', 'EXPLEOSOL', 'HATSUN', 'GODREJIND', 'MACPOWER', 'WEALTH', 'GROBTEA', 'GMBREW',
-    'SUDARSCHEM', 'ENTERO', 'ASAHIINDIA', 'RPEL', 'AJMERA', 'VIJAYA', 'DSSL', 'KPRMILL', 'KSCL', 'GABRIEL',
-    'XPROINDIA', 'GLOBUSSPR', 'BATAINDIA', 'ASALCBR', 'AHLUCONT', 'JYOTICNC', 'SHARDAMOTR', 'WAAREERTL', 'MAITHANALL', 'UNIMECH',
-    'SUNDRMFAST', 'ELDEHSG', 'ACE', 'ARE&M', 'EXCELINDUS', 'CARYSIL', 'CHENNPETRO', 'WHIRLPOOL', 'ATLANTAELE', 'NUCLEUS',
-    'PREMIERENE', 'SHARDACROP', 'CANFINHOME', 'CLEAN', 'ASTRAMICRO', 'NATCOPHARM', 'KAUSHALYA', 'CHALET', 'SAILIFE', 'PSPPROJECT',
-    'UNIVCABLES', 'ALIVUS', 'BRIGADE', 'STAR', 'APLLTD', 'CARBORUNIV', 'GANECOS', 'AVALON', 'NAM-INDIA', 'SYMPHONY',
-    'ALLDIGI', 'SUBROS', 'POKARNA', 'AETHER', 'MOTILALOFS', 'INDIASHLTR', 'ALICON', 'NEWGEN', 'IZMO', 'ORCHPHARMA',
-    'YUKEN', 'GOKEX', 'ELECTHERM', 'CENTURYPLY', 'WHEELS', 'PASHUPATI', 'CEMPRO', 'POLYPLEX', 'FACT', 'DATAMATICS',
-    'PITTIENG', 'RIIL', 'NDRAUTO', 'GANESHHOU', 'HBLENGINE', 'ISGEC', 'AVANTIFEED', 'MEDPLUS', 'SHYAMMETL', 'SILVERTUC',
-    'INDNIPPON', 'TINNARUBR', 'WELCORP', 'SENORES', 'WINDLAS', 'CNL', 'JKLAKSHMI', 'KRN', 'PROTEAN', 'ALBERTDAVD',
-    'HDBFS', 'PKTEA', 'ICEMAKE', 'HEXT', '63MOONS', 'VMART', 'BIL', 'NELCO', 'HGINFRA', 'DECCANCE',
-    'MANGLMCEM', 'GALAPREC', 'ABSLAMC', 'AEGISLOG', 'GANDHITUBE', 'RPSGVENT', 'CHOICEIN', 'TEMBO', 'ASHAPURMIN', 'SUPRIYA',
-    'RML', 'AARTIPHARM', 'FINCABLES', 'SYRMA', 'KSB', 'ZENSARTECH', 'KRSNAA', 'BIKAJI', 'SPAL', 'CONTROLPR',
-    'AGI', 'KSL', 'TATAINVEST', 'INNOVACAP', 'SVLL', 'CAPILLARY', 'COSMOFIRST', 'SCHNEIDER', 'SUNDROP', 'HCG',
-    'RVTH', 'JUSTDIAL', 'BANCOINDIA', 'DENORA', 'VENTIVE', 'JSLL', 'MONTECARLO', 'ASTEC', 'QPOWER', 'INSECTICID',
-    'YATHARTH', 'ANTHEM', 'SUDEEPPHRM', 'SALZERELEC', 'JUBLINGREA', 'INFOBEAN', 'KEC', 'BUTTERFLY', 'AMRUTANJAN', 'TDPOWERSYS',
-    'AGARIND', 'FAIRCHEMOR', 'ROUTE', 'SUNDRMBRAK', 'ROSSTECH', 'GARFIBRES', 'PARAS', 'KIMS', 'RATEGAIN', 'KALYANIFRG',
-    'RAMCOSYS', 'SPLPETRO', 'BLACKBUCK', 'SHAKTIPUMP', 'VARROC', 'SIYSIL', 'EUREKAFORB', 'ATHERENERG', 'TTKPRESTIG', 'SWELECTES',
-    'GLOSTERLTD', 'BALUFORGE', 'RUBICON', 'SUYOG', 'ABDL', 'ORKLAINDIA', 'STOVEKRAFT', 'EMUDHRA', 'ASTERDM', 'RAMRAT',
-    'PNGJL', 'PRICOLLTD', 'AJAXENGG', 'VIMTALABS', 'ARSSBL', 'MANYAVAR', 'ARVSMART', 'WEWORK', 'DIVGIITTS', 'GALLANTT',
-    'GODREJAGRO', 'SOLARA', 'ROSSARI', 'MINDACORP', 'TRANSRAILL', 'PAUSHAKLTD', 'SFL', 'GHCL', 'MOLDTKPAC', 'CELLO',
-    'JBMA', 'FIVESTAR', 'TCIEXP', 'NAVA', 'JKIL', 'SRM', 'SUNTV', 'KIRIINDUS', 'SANDHAR', 'MAHSEAMLES',
-    'BLUEJET', 'JARO', 'PICCADIL', 'TANLA', 'ITDC', 'RAMKY', 'WESTLIFE', 'ANANTRAJ', 'MARATHON', 'MATRIMONY',
-    'TIPSMUSIC', 'BORORENEW', 'STUDDS', 'WONDERLA', 'CARRARO', 'GRAPHITE', 'BERGEPAINT', 'EMAMILTD', 'RUSTOMJEE', 'OPTIEMUS',
-    'COHANCE', 'HEG', 'HNDFDS', 'TRITURBINE', 'SGIL', 'OSWALPUMPS', 'STEL', 'BLUESTONE', 'INDGN', 'KRISHANA',
-    'ARROWGREEN', 'GMDCLTD', 'KRYSTAL', 'LANDMARK', 'BBOX', 'RKFORGE', 'SILINV', 'EVERESTIND', 'WELENT', 'LEMERITE',
-    'SARDAEN', 'APOLLOTYRE', 'AVL', 'GUJALKALI', 'TMB', 'MAGADSUGAR', 'AGARWALEYE', 'JINDRILL', 'PREMEXPLN', 'ASAL', 'VISHNU',
-    'LATENTVIEW', 'JINDALPOLY', 'AWFIS', 'ARVINDFASN', 'SRHHYPOLTD', 'GNFC', 'HAPPSTMNDS', 'KKCL', 'ACI', 'UNIPARTS',
-    'AADHARHFC', 'DICIND', 'ELGIEQUIP', 'MAYURUNIQ', 'RAYMONDREL', 'ELECON', 'MANORG', 'TEJASNET', 'VESUVIUS', 'BAJAJELEC',
-    'NRAIL', 'SIRCA', 'TENNIND', 'LINCOLN', 'HERITGFOOD', 'SMARTWORKS', 'GOCOLORS', 'UFLEX', 'MSTCLTD', 'INDRAMEDCO',
-    'SHANTIGEAR', 'KRISHIVAL', 'MEDIASSIST', 'REPRO', 'ASKAUTOLTD', 'HSCL', 'STARHEALTH', 'FMGOETZE', 'CHEMFAB', 'HLEGLAS',
-    'TSFINV', 'FAZE3Q', 'SUMICHEM', 'SWANCORP', 'UNICHEMLAB', 'JKTYRE', 'TI', 'RAYMOND', 'SBCL', 'GRMOVER',
-    'SANATHAN', 'CENTENKA', 'HGS', 'VTL', 'DBL', 'RAJRATAN', 'JASH', 'AWHCL', 'SUPRAJIT', 'MAXESTATES',
-    'INNOVANA', 'UNITEDTEA', 'MANINDS', 'SANGAMIND', 'HEUBACHIND', 'RHIM', 'ATULAUTO', 'DEEPINDS', 'USHAMART', 'PRECOT',
-    'GUJAPOLLO', 'SHOPERSTOP', 'BALRAMCHIN', 'SKIPPER', 'SKMEGGPROD', 'THYROCARE', 'JSFB', 'CHAMBLFERT', 'IGARASHI', 'BSOFT', 'CYIENTDLM',
-    'DLINKINDIA', 'ZYDUSWELL', 'IDEAFORGE', 'NIPPOBATRY', 'KPIGREEN', 'AKUMS', 'SAKAR', 'MAMATA', 'HINDCOMPOS', 'SOMANYCERA',
-    'CEWATER', 'FDC', 'SWIGGY', 'ABCOTS', 'INDIACEM', 'GENESYS', 'EMSLIMITED', 'BAJAJHCARE', 'INDIANHUME', 'BFINVEST',
-    'NINSYS', 'MBAPL', 'WSTCSTPAPR', 'TIPSFILMS', 'TRUALT', 'IGPL', 'LENSKART', 'MEDICAMEQ', 'RELAXO', 'NIITMTS',
-    'RSYSTEMS', 'REPCOHOME', 'MAHLIFE', 'SUNTECK', 'RISHABH', 'AARTISURF', 'CIEINDIA', 'AFCONS', 'THELEELA', 'ANTELOPUS',
-    'GUJGASLTD', 'AARTIDRUGS', 'CUPID', 'MODINATUR', 'HPL', 'GOACARBON', 'CSBBANK', 'KRBL', 'GUJTHEM', 'BELLACASA',
-    'TAJGVK', 'SGFIN', 'KOLTEPATIL', 'SHREEPUSHK', 'ROHLTD', 'JAINREC', 'AVADHSUGAR', 'GICRE', 'HINDCOPPER', 'LTFOODS',
-    'DOLPHIN', 'EIHOTEL', 'MBEL', 'SAATVIKGL', 'SHIVALIK', 'TMCV', 'HARSHA', 'SOTL', 'APCOTEXIND', 'GOLDIAM',
-    'MEIL', 'JGCHEM', 'SAREGAMA', 'JKPAPER', 'BESTAGRO', 'PANACEABIO', 'PDSL', 'CREST', 'MMFL', 'EIHAHOTELS',
-    'TRIVENI', 'AARTIIND', 'HARIOMPIPE', 'KAYA', 'ELLEN', 'DOLLAR', 'VIPIND', 'IONEXCHANG', 'CMSINFO', 'SONATSOFTW', 'KALPATARU',
-    'THOMASCOTT', 'GUFICBIO', 'ZAGGLE', 'KPEL', 'TMPV', 'M&MFIN', 'MODIS', 'NUVOCO', 'KIOCL', 'RPTECH',
-    'ORIENTTECH', 'GODIGIT', 'KILITCH', 'FSL', 'GEECEE', 'SGMART', 'DYCL', 'SHREEJISPG', 'SHILPAMED', 'VGUARD',
-    'VIDHIING', 'RAILTEL', 'ASIANHOTNR', 'MOIL', 'SIS', 'EVEREADY', 'TATACAP', 'SOFTTECH', 'MAHLOG', 'MASFIN',
-    'SKYGOLD', 'ARIES', 'BAJAJINDEF', 'SMSPHARMA', 'BLS', 'IGIL', 'PARAGMILK', 'IIFLCAPS', 'BANSALWIRE', 'DENTA', 'ARVIND',
-    'NITINSPIN', 'RAMCOIND', 'ZUARIIND', 'ARIHANTSUP', 'KEYFINSERV', 'MHRIL', 'DIFFNKG', 'GOPAL', 'PCBL',
-    'GVPIL', 'SENCO', 'ADVENZYMES', 'SEMAC', '5PAISA', 'ZODIAC', 'SANGHVIMOV', 'ITI', 'IRIS', 'MONARCH',
-    'GNA', 'PRAJIND', 'GENUSPOWER', 'GOCLCORP', 'TRF', 'EUROPRATIK', 'SASTASUNDR', 'MIDHANI', 'APOLLOPIPE', 'SHIVAUM',
-    'VLSFINANCE', 'BOROLTD', 'FLAIR', 'CRAMC', 'KAPSTON', 'DALMIASUG', 'NURECA', 'ASIANENE', 'EPACKPEB', 'STYL',
-    'EFCIL', 'ZUARI', 'APTUS', 'ASHIANA', 'CSLFINANCE', 'DVL', 'FIRSTCRY', 'GSPL', 'VSSL', 'KSOLVES',
-    'SOLARWORLD', 'ICIL', 'IVALUE', 'SALONA', 'NRBBEARING', 'S&SPOWER', 'OAL', 'SCPL', 'DDEVPLSTIK', 'IRMENERGY',
-    'JYOTHYLAB', 'PONNIERODE', 'SURAKSHA', 'CRIZAC', 'QUICKHEAL', 'TALBROAUTO', 'PRIMESECU', 'REDINGTON', 'TARIL', 'ARTEMISMED',
-    'TEAMGTY', 'LIBERTSHOE', 'EBGNG', 'MUTHOOTCAP', 'ONWARDTEC', 'WINDMACHIN', 'PANAMAPET', 'RITCO', 'GREENPLY', 'STYLEBAAZA',
-    'HINDWAREAP', 'INDOBORAX', 'VALIANTORG', 'JSWINFRA', 'CUB', 'SIMPLEXINF', 'DYNPRO', 'BECTORFOOD', 'SPANDANA', 'CPEDU',
-    'STERTOOLS', 'STARTECK', 'MWL', 'VRLLOG', 'ORIENTBELL', 'FINOPB', 'SRGHFL', 'QUADFUTURE', 'ALLTIME', 'LAXMIDENTL',
-    'TIL', 'LGHL', 'APEX', 'AGIIL', 'SURAJEST', 'RALLIS', 'CAMPUS', 'CAPITALSFB', 'NAHARCAP', 'DIAMINESQ',
-    'HONASA', 'CHEMPLASTS', 'JUNIPER', 'SURYAROSNI', 'DMCC', 'JWL', 'SURAJLTD', 'NORTHARC', 'NAHARPOLY', 'CANTABIL',
-    'CAPACITE', 'CLSEL', 'IXIGO', 'EPACK', 'VSTIND', 'PODDARMENT', 'REFEX', 'PNCINFRA', 'BAJAJCON', 'UTTAMSUGAR',
-    'GODAVARIB', 'HIKAL', 'PRINCEPIPE', 'GREENLAM', 'SUNFLAG', 'MMP', 'PPL', 'DELPHIFX', 'ASAHISONG', 'SAHYADRI',
-    'AEGISVOPAK', 'AKSHARCHEM', 'AWL', 'PLATIND', 'KARURVYSYA', 'HUBTOWN', 'ZENITHEXPO', 'NLCINDIA', 'PURVA', 'VIKRAMSOLR',
-    'INDIANCARD', 'INDOCO', 'INDOSTAR', 'DCI', 'DBCORP', 'SESHAPAPER', 'HERANBA', 'UNIVPHOTO', 'VINYLINDIA', 'GANESHCP',
-    'FABTECH', 'GPIL', 'SAPPHIRE', 'GREENPANEL', 'DHARMAJ', 'MOBIKWIK', 'WANBURY', 'PINELABS', 'ASPINWALL', 'VAIBHAVGBL',
-    'APOLLO', 'PRECWIRE', 'CEIGALL', 'JNKINDIA', 'RELIGARE', 'TIRUMALCHM', 'KAMATHOTEL', 'ECOSMOBLTY', 'EIFFL', 'BHAGCHEM',
-    'TARSONS', 'ACMESOLAR', 'RITES', 'NAZARA', 'SCI', 'MHLXMIRU', 'STANLEY', 'KANSAINER', 'ADVENTHTL', 'SIGNPOST',
-    'STARCEMENT', 'MAZDA', 'ALPHAGEO', 'KABRAEXTRU', 'DCAL', 'SREEL', 'PPAP', 'SWSOLAR', 'NIRAJISPAT', 'RUBYMILLS',
-    'DEEDEV', 'BLSE', 'EPL', 'SANDUMA', 'SULA', 'LOYALTEX', 'SAGCEM', 'HUHTAMAKI', 'DAMCAPITAL', 'STEELCAS',
-    'ADFFOODS', 'UNIDT', 'AFFORDABLE', 'SEQUENT', 'QUESS', 'IFGLEXPOR', 'PATELRMART', 'JAYKAY', 'MOSCHIP', 'KNAGRI',
-    'LAOPALA', 'BLAL', 'UTLSOLAR', 'JAYAGROGN', 'ARVEE', 'INOXGREEN', 'MARINE', 'GARUDA', 'JAGSNPHARM', 'KTKBANK',
-    'CHEMCON', 'AFSL', 'PENIND', 'PFOCUS', 'EIEL', 'RHL', 'PACEDIGITK', 'NAHARSPING', 'KANPRPLA', 'GLOBALVECT',
-    'NCLIND', 'BBTCL', 'MINDTECK', 'NITIRAJ', 'SHRINGARMS', 'DPWIRES', 'GOKULAGRO', 'KITEX', 'RESPONIND', 'INDIQUBE',
-    'SHANTIGOLD', 'MARKSANS', 'EMMVEE', 'ITCHOTELS', 'SHALBY', 'ENGINERSIN', 'RAJESHEXPO', 'MAXIND', 'INDOFARM', '20MICRONS', 'SAKSOFT',
-    'VERANDA', 'NATCAPSUQ', 'SSWL', 'GPPL', 'TIMETECHNO', 'PRABHA', 'CORDSCABLE', 'ORBTEXP', 'LIKHITHA', 'CGCL',
-    'CASTROLIND', 'AARON', 'MVGJL', 'UFBL', 'GREAVESCOT', 'EUROBOND', 'SHREYANIND', 'KCP', 'LFIC', 'TRANSWORLD',
-    'ORIENTELEC', 'SAMHI', 'PROSTARM', 'BHARATWIRE', 'BHARATSE', 'BALMLAWRIE', 'KROSS', 'IKIO', 'BHAGERIA', 'YATRA',
-    'AEROFLEX', 'SHIVATEX', 'WALCHANNAG', 'HEIDELBERG', 'MUTHOOTMF', 'AURUM', 'AMNPLST', 'MANCREDIT', 'LORDSCHLO', 'SPMLINFRA',
-    'LOKESHMACH', 'SHAREINDIA', 'UDS', 'GSFC', 'NIACL', 'IITL', 'WEL', 'DCBBANK', 'KHADIM',
-    'UGROCAP', 'LXCHEM', 'SUVEN', 'ELIN', 'MARKOLINES', 'IPL', 'HITECHCORP', 'PYRAMID', 'SHK', 'HEXATRADEX',
-    'BAJEL', 'CONSOFINVT', 'FINPIPE', 'ORIENTCEM', 'AVG', 'RELTD', 'ASHOKA', 'VINCOFE', 'MEESHO', 'URAVIDEF',
-    'CHEMBOND', 'TBZ', 'DCMSRIND', 'CAMLINFINE', 'PLASTIBLEN', 'LEMONTREE', 'RUPA', 'BSL', 'DCXINDIA', 'DTIL',
-    'GICHSGFIN', 'HARRMALAYA', 'AYMSYNTEX', 'JINDALSAW', 'STARPAPER', 'SCHAND', 'CHEMBONDCH', 'MOLDTECH', 'SYSTMTXC', 'TAINWALCHM',
-    'BELRISE', 'RATNAVEER', 'NOCIL', 'FUSION', 'HISARMETAL', 'HERCULES', 'GKENERGY', 'ADSL', 'SCODATUBES', 'IRCON',
-    'SGLTL', 'LOTUSDEV', 'RAMAPHO', 'MAANALU', 'PARADEEP', 'PTC', 'PRECAM', 'WIPL', 'RSWM', 'NATHBIOGEN',
-    'AVANTEL', 'HINDOILEXP', 'KALAMANDIR', 'VGL', 'SAMMAANCAP', 'MRPL', 'RACE', 'BIRLAMONEY', 'SUKHJITS', 'GIPCL',
-    'IVP', 'SUPERHOUSE', 'AEQUS', 'JMFINANCIL', 'TARC', 'KNRCON', 'GROWW', 'JOCIL', 'ADANIPOWER', 'BLISSGVS',
-    'SATIN', 'JTEKTINDIA', 'ARKADE', 'TNPL', 'FEDFINA', 'GANGESSECU', 'KRONOX', 'WORTHPERI', 'GEMAROMA', 'NAVNETEDUL',
-    'RBZJEWEL', 'DIACABS', 'MODISONLTD', 'DIGITIDE', 'GPTHEALTH', 'THOMASCOOK', 'MANBA', 'RCF', 'RELCHEMQ', 'CROWN',
-    'WELSPUNLIV', 'UNIENTER', 'SURYODAY', 'MUKANDLTD', 'SPARC', 'GULPOLY', 'MONEYBOXX', 'PWL', 'MANAKCOAT', 'TVTODAY',
-    'VMM', 'PRAKASH', 'HEMIPROP', 'DEVYANI', 'PIGL', 'TOLINS', 'AHLEAST', 'KAKATCEM', 'BIRLACABLE', 'ROLEXRINGS',
-    'SMARTLINK', 'SOMICONVEY', 'HPIL', 'PARKHOTELS', 'LAXMIINDIA', 'BOMDYEING', 'MANINFRA', 'DHAMPURSUG', 'KOPRAN', 'PRSMJOHNSN',
-    'RGL', 'BANARBEADS', 'JAICORPLTD', 'AGRITECH', 'LOTUSEYE', 'DCMNVL', 'URBANCO', 'HECPROJECT', 'ABLBL', 'INDOUS',
-    'VSTL', 'MAHEPC', 'KOTHARIPET', 'TEXRAIL', 'BOROSCI', 'ARISINFRA', 'JAMNAAUTO', 'GANDHAR', 'LAMBODHARA', 'MUNJALSHOW',
-    'REDTAPE', 'PVSL', 'VRAJ', 'APCL', 'STCINDIA', 'AARVI', 'CANHLIFE', 'RNBDENIMS', 'ADVANCE', 'WCIL',
-    'JSWCEMENT', 'REPL', 'RUCHIRA', 'MASTERTR', 'DBREALTY', 'UNIECOM', 'DBEIL', 'EKC', 'INDOAMIN', 'RICOAUTO',
-    'REMSONSIND', 'GAEL', 'SECMARK', 'HIMATSEIDE', 'SPECIALITY', 'THEINVEST', 'UCAL', 'GMRP&UI', 'ENIL', 'AVROIND', 'CPCAP',
-    'BANSWRAS', 'RKSWAMY', 'SHANKARA', 'TOKYOPLAST', 'LINC', 'DREAMFOLKS', 'EXICOM', 'MUFIN', 'EMIL', 'TVSSCS',
-    'NELCAST', 'AUSOMENT', 'NAHARINDUS', 'SHEMAROO', 'PALASHSECU', 'BALAJITELE', 'JKIPL', 'VETO', 'SDBL', 'ESTER',
-    'RAIN', 'GILLANDERS', 'ORIENTHOT', 'MENONBE', 'TEXINFRA', 'SINTERCOM', 'AMANTA', 'SBFC', 'PAKKA', 'TNPETRO',
-    'TOUCHWOOD', 'AIROLAM', 'EDELWEISS', 'GPTINFRA', 'THEMISMED', 'MODIRUBBER', 'OMINFRAL', 'J&KBANK', 'RPPINFRA', 'ALEMBICLTD', 'KECL',
-    'BEDMUTHA', 'STLTECH', 'GTPL', 'WEIZMANIND', 'FINKURVE', 'IDBI', 'ISFT', 'OMAXAUTO', 'DONEAR', 'PDMJEPAPER',
-    'EXCELSOFT', 'BSHSL', 'KHAITANLTD', 'BROOKS', 'MUFTI', 'INDSWFTLAB', 'SMLT', 'APTECHT', 'STEELCITY', 'EMMBI',
-    'BAJAJHFL', 'MAHAPEXLTD', 'CUBEXTUB', 'SAMBHV', 'OCCLLTD', 'NAVKARCORP', 'ARIHANTCAP', 'INTLCONV', 'ZEEL', 'VIKRAN',
-    'SANSTAR', 'ATLASCYCLE', 'ARCHIDPLY', 'DCM', 'PAR', 'HITECH', 'NTPCGREEN', 'KUANTUM', 'NITCO', 'KOKUYOCMLN',
-    'WEBELSOLAR', 'NDLVENTURE', 'SPORTKING', 'BEPL', 'EMAMIPAP', 'SHREDIGCEM', 'OMFREIGHT', 'JAYBARMARU', 'INSPIRISYS', 'NIITLTD', 'JAYSREETEA',
-    'KRITI', 'ZODIACLOTH', 'AERONEU', 'SAURASHCEM', 'NFL', 'DOLATALGO', 'EMAMIREAL', 'SARLAPOLY', 'CINELINE', 'SHRIRAMPPS',
-    'SMCGLOBAL', 'IGCL', 'MAWANASUG', 'WSI', 'SINCLAIR', 'IOLCP', 'SERVOTECH', 'KHAICHEM', 'LOVABLE', 'CLEDUCATE',
-    'XCHANGING', 'NDTV', 'ALKALI', 'FOCUS', 'ATAM', 'SUPREME', 'SSDL', 'SPIC', 'ALPA', 'TOTAL',
-    'AEROENTER', 'DBOL', 'RMDRIP', 'PNBGILTS', 'ANUHPHR', 'MUNJALAU', 'GANESHBE', 'ADL', 'JMA', 'LYKALABS',
-    'UFO', 'ORIENTLTD', 'ANDHRSUGAR', 'KANORICHEM', 'TARACHAND', 'NIVABUPA', 'VERTOZ', 'RUBFILA', 'AUTOIND', 'RADHIKAJWE',
-    'BALPHARMA', 'FOODSIN', 'ACL', 'ZIMLAB', 'BRIGHOTEL', 'MADRASFERT', 'VPRPL', 'JAYNECOIND', 'KOTHARIPRO', 'EMBDL',
-    'GHCLTEXTIL', 'REGAAL', 'SILGO', 'DELTAMAGNT', 'ELECTCAST', 'DELTACORP', 'JAGRAN', 'GEOJITFSL', 'TRIGYN', 'SUMIT',
-    'SHAHALLOYS', 'MITCON', 'KREBSBIO', 'BLUSPRING', 'LAGNAM', 'RBA', 'ANDHRAPAP', 'SATIA', 'VALIANTLAB', 'AVTNPL',
-    'TPLPLASTEH', 'TFCILTD', 'VISAKAIND', 'BIGBLOC', 'HMVL', 'UNIVASTU', 'ISHANCH', 'BANKA', 'NKIND', 'OILCOUNTUB',
-    'HGM', 'OMAXE', 'KRITINUT', 'MOL', 'ASIANTILES', 'RAJOOENG', 'SANGHIIND', 'MANAKSIA', 'GLOBECIVIL', 'MUKTAARTS',
-    'ROTO', 'SHIVAMILLS', 'HILINFRA', 'MANALIPETC', 'JTLIND', 'JAIBALAJI', 'DCW', 'NRL', 'GATEWAY', 'GLOTTIS',
-    'BMWVENTLTD', 'SHALPAINTS', 'SRD', 'DJML', 'OSWALAGRO', 'GFLLIMITED', 'EQUITASBNK', 'VASWANI', 'SURYALAXMI', 'ADVANIHOTR',
-    'LLOYDSENT', 'PRITI', 'RSSOFTWARE', 'MANAKSTEEL', 'BPL', 'MAHABANK', 'ONMOBILE', 'SIGIND', 'OBCL', 'MMTC',
-    'ANIKINDS', 'RKEC', 'ROSSELLIND', 'VMSTMT', 'UJJIVANSFB', 'FILATEX', 'ELGIRUBCO', 'RADIANTCMS', 'BODALCHEM', 'PASUPTAC',
-    'BYKE', 'GOLDTECH', 'LLOYDSENGG', 'ONEPOINT', 'KARMAENG', 'TARMAT', 'VIDYAWIRES', 'MEDICO', 'BLKASHYAP', 'AMJLAND',
-    'AHLADA', 'AMDIND', 'ROML', 'TEXMOPIPES'
-]
+# -----------------------------
+# FILTERS / TUNING
+# -----------------------------
+MIN_VOL_SMA = int(os.getenv("MIN_VOL_SMA", "1000"))  # keep stocks with SMA >= MIN_VOL_SMA
+MAX_CONCURRENCY = int(os.getenv("SYNC_CONCURRENCY", "6"))  # parallel tasks
+REQ_SLEEP = float(os.getenv("SYNC_SLEEP_SEC", "0.34"))  # Zerodha-friendly delay per task
+HIST_LOOKBACK_DAYS = int(os.getenv("HIST_LOOKBACK_DAYS", "10"))
+CANDLE_INTERVAL = os.getenv("HIST_INTERVAL", "day")
+
+# -----------------------------
+# STOCK UNIVERSE (example)
+# -----------------------------
+STOCK_INDEX_MAPPING = {
+    "MRF": "NIFTY 500",
+    "VIDYAWIRES": "NIFTY 500",
+    "MEDICO": "NIFTY 500",
+    "BLKASHYAP": "NIFTY 500",
+    "AMJLAND": "NIFTY 500",
+    "AHLADA": "NIFTY 500",
+    "AMDIND": "NIFTY 500",
+    "ROML": "NIFTY 500",
+    "TEXMOPIPES": "NIFTY 500",
+}
 
 
-async def run_morning_sync():
+def _now_ist() -> datetime:
+    return datetime.now(IST)
+
+
+def _safe_float(x, d=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return d
+
+
+def _safe_int(x, d=0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return d
+
+
+def _compute_sma_from_records(records: List[dict]) -> float:
     """
-    Core function to prepare the engine for the trading day.
-    1. Fetches Access Token from Redis.
-    2. Filters Kite Master Instruments.
-    3. Fetches Historical Data to calculate PDH/PDL.
-    4. Saves results to Redis for low-latency engine access.
+    records: list of daily candles with volume/high/low/close etc.
+    SMA definition used in your app:
+      avg_vol_per_minute = (sum(last 5 sessions volume)) / 1875
+    1875 = 5 days * 375 minutes/session (NSE regular)
     """
-    logger.info("--- 🌅 MORNING SYNC STARTED ---")
+    if len(records) < 6:
+        return 0.0
+    last_5 = records[-6:-1]  # last 5 completed sessions
+    total_vol = sum(_safe_int(day.get("volume", 0), 0) for day in last_5)
+    avg_vol_per_minute = total_vol / 1875.0
+    return round(avg_vol_per_minute, 2)
 
-    # 1. API Credentials Setup
-    api_key, _ = await TradeControl.get_config()
+
+async def _fetch_one(
+    kite: KiteConnect,
+    t_id: int,
+    symbol: str,
+    sem: asyncio.Semaphore,
+) -> Tuple[int, str, bool, float, Optional[dict]]:
+    """
+    Fetch historical -> compute SMA -> build market_data
+    Returns:
+      (token, symbol, eligible, sma, market_data_if_any)
+    """
+    async with sem:
+        try:
+            to_date = _now_ist()
+            from_date = to_date - timedelta(days=HIST_LOOKBACK_DAYS)
+
+            # network call in thread (kiteconnect is sync)
+            records = await asyncio.to_thread(
+                kite.historical_data,
+                t_id,
+                from_date,
+                to_date,
+                CANDLE_INTERVAL,
+            )
+
+            sma = _compute_sma_from_records(records)
+            if sma < MIN_VOL_SMA:
+                return (t_id, symbol, False, sma, None)
+
+            last_5 = records[-6:-1]
+            last = last_5[-1]
+
+            market_data = {
+                "symbol": symbol,
+                "sma": float(sma),
+                "pdh": _safe_float(last.get("high", 0.0), 0.0),
+                "pdl": _safe_float(last.get("low", 0.0), 0.0),
+                "prev_close": _safe_float(last.get("close", 0.0), 0.0),
+                "sync_time": _now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+
+            return (t_id, symbol, True, sma, market_data)
+
+        except Exception as e:
+            logger.debug(f"Error syncing {symbol} ({t_id}): {e}")
+            return (t_id, symbol, False, 0.0, None)
+
+        finally:
+            # Zerodha historical rate-limit friendliness
+            await asyncio.sleep(REQ_SLEEP)
+
+
+async def _persist_results(results: List[Tuple[int, str, bool, float, Optional[dict]]]) -> Tuple[List[int], List[str]]:
+    """
+    Parallel Redis writes (safe).
+    Also cleans up non-eligible tokens so stale market cache doesn't remain.
+    """
+    eligible_tokens: List[int] = []
+    eligible_symbols: List[str] = []
+
+    async def _save_ok(t_id: int, md: dict):
+        await TradeControl.save_market_data(str(t_id), md)
+
+    async def _delete_bad(t_id: int):
+        # optional cleanup
+        await TradeControl.delete_market_data(str(t_id))
+
+    save_tasks = []
+    delete_tasks = []
+
+    for (t_id, sym, ok, sma, md) in results:
+        if ok and md:
+            eligible_tokens.append(int(t_id))
+            eligible_symbols.append(str(sym))
+            save_tasks.append(asyncio.create_task(_save_ok(t_id, md)))
+        else:
+            delete_tasks.append(asyncio.create_task(_delete_bad(t_id)))
+
+    # do Redis ops concurrently (this is the "parallel processing integration" for sync)
+    if save_tasks:
+        await asyncio.gather(*save_tasks, return_exceptions=True)
+    if delete_tasks:
+        await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+    return eligible_tokens, eligible_symbols
+
+
+async def run_sync() -> None:
+    logger.info("🚀 Starting Async Market Data Sync (parallel + SMA filter)...")
+
+    api_key, _api_secret = await TradeControl.get_config()
     access_token = await TradeControl.get_access_token()
 
     if not api_key or not access_token:
-        logger.error("❌ Sync Failed: API Key or Access Token not found in Redis. Login via Dashboard first.")
+        logger.error("❌ Sync Aborted: API Key or Access Token missing in Redis.")
         return
 
     try:
         kite = KiteConnect(api_key=api_key)
         kite.set_access_token(access_token)
-        
-        # 2. Fetch Instrument Master
-        logger.info("📡 Fetching NSE instruments...")
-        # to_thread use kiya hai taaki network blocking call async loop ko na roke
-        all_instruments = await asyncio.to_thread(kite.instruments, "NSE")
-        
-        # Filter based on watchlist
-        target_instruments = [
-            ins for ins in all_instruments 
-            if ins['tradingsymbol'] in WATCHLIST and ins['segment'] == 'NSE'
+
+        logger.info("📥 Fetching NSE instruments...")
+        instruments = await asyncio.to_thread(kite.instruments, "NSE")
+
+        # Build target list
+        target: List[Tuple[int, str]] = []
+        for instr in instruments:
+            sym = instr.get("tradingsymbol")
+            if sym and sym in STOCK_INDEX_MAPPING:
+                try:
+                    target.append((int(instr["instrument_token"]), str(sym)))
+                except Exception:
+                    pass
+
+        logger.info(f"🧭 Universe candidates: {len(target)} stocks")
+
+        if not target:
+            await TradeControl.save_subscribe_universe([], [])
+            await TradeControl.set_last_sync()
+            logger.warning("⚠️ No target stocks found. Universe cleared.")
+            return
+
+        sem = asyncio.Semaphore(MAX_CONCURRENCY)
+
+        # Parallel historical fetch
+        tasks = [
+            asyncio.create_task(_fetch_one(kite, t_id, sym, sem))
+            for (t_id, sym) in target
         ]
+        results = await asyncio.gather(*tasks)
 
-        logger.info(f"🔍 Watchlist filtered: {len(target_instruments)} stocks identified.")
+        # Persist to Redis (parallel writes + cleanup)
+        eligible_tokens, eligible_symbols = await _persist_results(results)
 
-        # 3. Process each stock for Technical Levels
-        universe_tokens = []
-        sync_count = 0
+        # Persist universe tokens list for websocket subscription
+        await TradeControl.save_subscribe_universe(eligible_tokens, eligible_symbols)
+        await TradeControl.set_last_sync()
 
-        for ins in target_instruments:
-            symbol = ins['tradingsymbol']
-            token = ins['instrument_token']
-            
-            # Historical Range: Last 10 days to ensure we get a complete daily candle
-            to_date = datetime.now(IST).date()
-            from_date = to_date - timedelta(days=10)
+        logger.info(
+            f"✅ SUCCESS: {len(eligible_tokens)} eligible stocks saved (SMA >= {MIN_VOL_SMA})."
+        )
+        logger.info(
+            f"📡 Universe tokens persisted: nexus:universe:tokens (count={len(eligible_tokens)})"
+        )
 
-            try:
-                # Fetch daily candles
-                hist = await asyncio.to_thread(
-                    kite.historical_data, token, from_date, to_date, "day"
-                )
-
-                if len(hist) >= 2:
-                    # Logic: If market hasn't opened today, hist[-1] is yesterday.
-                    # If market is open, hist[-2] is yesterday.
-                    # Safety check: Compare dates
-                    last_candle = hist[-1]
-                    if last_candle['date'].date() == to_date:
-                        prev_day = hist[-2]
-                    else:
-                        prev_day = hist[-1]
-
-                    # Calculate Volume SMA (Simple moving average of last 5 days volume)
-                    # This helps filtration in MomentumEngine
-                    recent_vols = [d['volume'] for d in hist[-6:-1]]
-                    vol_sma = sum(recent_vols) / len(recent_vols) if recent_vols else 0
-
-                    market_data = {
-                        "symbol": symbol,
-                        "token": token,
-                        "pdh": float(prev_day['high']),
-                        "pdl": float(prev_day['low']),
-                        "prev_close": float(prev_day['close']),
-                        "sma": int(vol_sma),
-                        "sync_time": datetime.now(IST).strftime("%H:%M:%S")
-                    }
-
-                    # Save to Redis
-                    await TradeControl.save_market_data(str(token), market_data)
-                    universe_tokens.append(token)
-                    sync_count += 1
-                    
-                    logger.info(f"✅ {symbol} -> PDH: {market_data['pdh']} | PDL: {market_data['pdl']} | SMA: {market_data['sma']}")
-                else:
-                    logger.warning(f"⚠️ {symbol}: Insufficient historical data.")
-
-            except Exception as e:
-                logger.error(f"❌ Error processing {symbol}: {e}")
-
-        # 4. Save the Final Universe for Ticker Subscription
-        r = await TradeControl.get_redis()
-        await r.set("nexus:universe:tokens", json.dumps(universe_tokens))
-        
-        logger.info(f"--- 🚀 SYNC COMPLETE: {sync_count} stocks ready for trading ---")
+        # Optional debug summary
+        if os.getenv("SYNC_DEBUG", "0") == "1":
+            kept = set(eligible_symbols)
+            dropped = [sym for (_, sym) in target if sym not in kept]
+            logger.info(f"DEBUG kept={sorted(list(kept))}")
+            logger.info(f"DEBUG dropped={sorted(dropped)}")
 
     except Exception as e:
-        logger.error(f"❌ Critical Sync Failure: {e}")
+        logger.error(f"❌ Critical Sync Failure: {e}", exc_info=True)
+
 
 if __name__ == "__main__":
-    # Heroku Scheduler or manual trigger logic
-    asyncio.run(run_morning_sync())
+    asyncio.run(run_sync())
