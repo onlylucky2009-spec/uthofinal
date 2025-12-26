@@ -271,7 +271,14 @@ async def login(request_token: Optional[str] = Query(None)):
         return RedirectResponse(url="/")
     except Exception as e:
         return HTMLResponse(f"<h3>Login Failed: {e}</h3>")
-
+@app.get("/api/config/auth")
+async def get_auth_config():
+    """Returns existing API Key and Secret masked or plain for dashboard."""
+    api_key, api_secret = await TradeControl.get_config()
+    return {
+        "api_key": api_key,
+        "api_secret": api_secret  # You can mask this if preferred: api_secret[:4] + "****"
+    }
 @app.get("/api/stats")
 async def get_stats():
     return {
@@ -315,6 +322,20 @@ async def save_settings(side: str, data: Dict[str, Any]):
         await TradeControl.save_strategy_settings(side, RAM_STATE["config"][side])
     return {"status": "success"}
 
+# @app.post("/api/control")
+# async def control(request: Request):
+#     data = await request.json()
+#     action = data.get("action")
+#     if action == "toggle_engine":
+#         side, enabled = data.get("side"), data.get("enabled")
+#         if side in RAM_STATE["engine_live"]: RAM_STATE["engine_live"][side] = bool(enabled)
+#     elif action == "square_off_one":
+#         symbol, side = data.get("symbol"), data.get("side")
+#         stock = next((s for s in RAM_STATE["stocks"].values() if s["symbol"] == symbol), None)
+#         if stock:
+#             if "mom" in side: await MomentumEngine.close_position(stock, RAM_STATE, "USER_EXIT")
+#             else: await BreakoutEngine.close_position(stock, RAM_STATE, "USER_EXIT")
+#     return {"status": "ok"}
 @app.post("/api/control")
 async def control(request: Request):
     data = await request.json()
@@ -322,12 +343,37 @@ async def control(request: Request):
     if action == "toggle_engine":
         side, enabled = data.get("side"), data.get("enabled")
         if side in RAM_STATE["engine_live"]: RAM_STATE["engine_live"][side] = bool(enabled)
+
     elif action == "square_off_one":
         symbol, side = data.get("symbol"), data.get("side")
         stock = next((s for s in RAM_STATE["stocks"].values() if s["symbol"] == symbol), None)
         if stock:
             if "mom" in side: await MomentumEngine.close_position(stock, RAM_STATE, "USER_EXIT")
             else: await BreakoutEngine.close_position(stock, RAM_STATE, "USER_EXIT")
+
+    elif action == "square_off_all":
+        side = data.get("side")
+        for stock in RAM_STATE["stocks"].values():
+            if side in ["bull", "bear"] and stock.get("brk_status") == "OPEN":
+                if stock.get("brk_side_latch") == side:
+                    await BreakoutEngine.close_position(stock, RAM_STATE, "USER_EXIT_ALL")
+            elif side in ["mom_bull", "mom_bear"] and stock.get("mom_status") == "OPEN":
+                if stock.get("mom_side_latch") == side:
+                    await MomentumEngine.close_position(stock, RAM_STATE, "USER_EXIT_ALL")
+
+    elif action == "save_api":
+        api_key = data.get("api_key")
+        api_secret = data.get("api_secret")
+        if api_key and api_secret:
+            success = await TradeControl.save_config(api_key, api_secret)
+            RAM_STATE["api_key"] = api_key
+            RAM_STATE["api_secret"] = api_secret
+            if success:
+                logger.info("✅ Dashboard: API Credentials saved to Redis and RAM.")
+                return {"status": "success"}
+            else:
+                return {"status": "error", "message": "Redis Save Failed"}
+
     return {"status": "ok"}
 
 # -----------------------------
