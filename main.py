@@ -394,7 +394,14 @@ async def startup_event():
     api_key, api_secret = await TradeControl.get_config()
     token = await TradeControl.get_access_token()
     RAM_STATE.update({"api_key": api_key, "api_secret": api_secret, "access_token": token})
-
+    if api_key and token:
+        try:
+            kite = KiteConnect(api_key=api_key)
+            kite.set_access_token(token)
+            RAM_STATE["kite"] = kite
+            logger.info("✅ Kite Session Restored successfully.")
+        except Exception as e:
+            logger.error(f"❌ Failed to restore Kite session: {e}")
     # Load Universe
     market_data = await TradeControl.get_all_market_data()
     for t_str, data in market_data.items():
