@@ -156,6 +156,7 @@ class BreakoutEngine:
             return
 
         now = datetime.now(IST)
+        logger.info(f"🔍 [DATA-AUDIT] {symbol} | PDH: {pdh} | PDL: {pdl} | Candle Open: {c_open} | Close: {close}")
 
         # --- BULL BREAKOUT ---
         if close > pdh and c_open < pdh:
