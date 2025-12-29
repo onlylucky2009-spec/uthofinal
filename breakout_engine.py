@@ -321,17 +321,56 @@ class BreakoutEngine:
             BreakoutEngine._reset_waiting(stock)
             return
 
-        # SL derived from trigger candle opposite extreme
+        # # SL derived from trigger candle opposite extreme
+        # trig_candle = stock.get("brk_trigger_candle") or {}
+        # entry = float(ltp)
+
+        # if side_key == "bull":
+        #     sl_px = float(trig_candle.get("low", 0) or 0)
+        # else:
+        #     sl_px = float(trig_candle.get("high", 0) or 0)
+
+        # if sl_px <= 0:
+        #     sl_px = round(entry * (0.995 if side_key == "bull" else 1.005), 2)
+        # -------------------- SL derived from trigger candle size --------------------
         trig_candle = stock.get("brk_trigger_candle") or {}
         entry = float(ltp)
 
-        if side_key == "bull":
-            sl_px = float(trig_candle.get("low", 0) or 0)
-        else:
-            sl_px = float(trig_candle.get("high", 0) or 0)
+        tc_high  = float(trig_candle.get("high", 0) or 0)
+        tc_low   = float(trig_candle.get("low", 0) or 0)
+        tc_close = float(trig_candle.get("close", 0) or 0) or entry
 
-        if sl_px <= 0:
-            sl_px = round(entry * (0.995 if side_key == "bull" else 1.005), 2)
+        range_pct = ((tc_high - tc_low) / tc_close) * 100.0 if tc_close > 0 else 0.0
+
+        pdh = float(stock.get("pdh", 0) or 0)
+        pdl = float(stock.get("pdl", 0) or 0)
+
+        sl_px = 0.0
+
+        if range_pct <= 0.7:
+            # ✅ small candle => SL at candle extreme
+            if side_key == "bull":
+                sl_px = tc_low
+            else:
+                sl_px = tc_high
+        else:
+            # ✅ extended candle (>0.7%) => SL at PDH/PDL
+            # NOTE: the 0.5% extension rule is already enforced by _range_gate_ok()
+            if side_key == "bull" and pdh > 0 and pdh < entry:
+                sl_px = pdh
+            elif side_key == "bear" and pdl > 0 and pdl > entry:
+                sl_px = pdl
+
+            # fallback (if pdh/pdl missing or invalid)
+            if sl_px <= 0:
+                if side_key == "bull":
+                    sl_px = tc_low
+                else:
+                    sl_px = tc_high
+
+            # final fallback if candle data bad
+            if sl_px <= 0:
+                sl_px = round(entry * (0.995 if side_key == "bull" else 1.005), 2)
 
         # qty sizing
         risk_per_share = max(abs(entry - sl_px), entry * 0.005)
