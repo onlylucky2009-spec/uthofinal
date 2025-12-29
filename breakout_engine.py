@@ -347,7 +347,7 @@ class BreakoutEngine:
 
         sl_px = 0.0
 
-        if range_pct <= 0.7:
+        if range_pct <= 0.5:
             # ✅ small candle => SL at candle extreme
             if side_key == "bull":
                 sl_px = tc_low
@@ -636,7 +636,7 @@ class BreakoutEngine:
             return False
 
         range_pct = ((high - low) / close) * 100.0
-        if range_pct <= 0.7:
+        if range_pct <= 0.5:
             return True
 
         if side == "bull":
