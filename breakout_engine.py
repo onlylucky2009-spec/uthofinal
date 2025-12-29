@@ -373,8 +373,8 @@ class BreakoutEngine:
                 sl_px = round(entry * (0.995 if side_key == "bull" else 1.005), 2)
 
         # qty sizing
-        risk_per_share = max(abs(entry - sl_px), entry * 0.005)
-        risk_amount = float(cfg.get("risk_trade_1", 2000) or 2000)
+        risk_per_share = abs(entry - sl_px)
+        risk_amount = float(cfg.get("risk_trade_1", 20) or 20)
         qty = floor(risk_amount / risk_per_share)
 
         if qty <= 0:
@@ -386,7 +386,7 @@ class BreakoutEngine:
 
         # Targets / trail
         try:
-            rr_val = float(str(cfg.get("risk_reward", "1:2")).split(":")[-1])
+            rr_val = float(str(cfg.get("risk_reward", "1:5")).split(":")[-1])
         except Exception:
             rr_val = 2.0
 

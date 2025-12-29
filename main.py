@@ -19,7 +19,6 @@ from breakout_engine import BreakoutEngine
 from momentum_engine import MomentumEngine
 
 # -----------------------------
-# ✅ HEROKU / GUNICORN TWISTED SIGNAL BYPASS
 # -----------------------------
 try:
     from twisted.internet import reactor  # type: ignore
